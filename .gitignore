@@ -1,0 +1,34 @@
+# ---------------------------------------------------------------------------
+# PRIVACY: real loan data must never be committed.
+# The app writes to ~/Library/Application Support/StudentLoanMotivator/ so your
+# balances live outside this repo by design. These rules are belt-and-braces in
+# case a data file ever gets copied in here.
+# ---------------------------------------------------------------------------
+student_loans.json
+student_loans.*.json
+*_settings.json
+*.local.json
+data/
+snapshots/
+*.csv
+
+# The fake-numbers template IS tracked - re-allow it after the rules above.
+!example_loans.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.Python
+
+# Build artifacts
+build/
+dist/
+*.spec.bak
+icon.iconset/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/

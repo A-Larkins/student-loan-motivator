@@ -1,0 +1,70 @@
+{
+  "_comment": [
+    "TEMPLATE ONLY - every number in this file is made up.",
+    "The app reads and writes the real file at:",
+    "  ~/Library/Application Support/StudentLoanMotivator/student_loans.json",
+    "Nothing here is loaded automatically. This exists to document the schema",
+    "and to give you something to copy if you would rather seed the file by hand",
+    "than type loans into the UI."
+  ],
+
+  "loans": [
+    {
+      "id": "11111111-1111-1111-1111-111111111111",
+      "name": "Undergrad Unsub '17",
+      "rate": 5.31,
+      "original_amount": 12000.0,
+      "snapshot_principal": 7400.0,
+      "snapshot_accrued": 0.0,
+      "snapshot_at": "2026-07-01T00:00:00",
+      "status": "active",
+      "eliminated_on": "",
+      "note": ""
+    },
+    {
+      "id": "22222222-2222-2222-2222-222222222222",
+      "name": "Grad Unsub '21",
+      "rate": 6.54,
+      "original_amount": 20500.0,
+      "snapshot_principal": 18250.0,
+      "snapshot_accrued": 41.18,
+      "snapshot_at": "2026-07-01T00:00:00",
+      "status": "active",
+      "eliminated_on": "",
+      "note": ""
+    },
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "name": "Perkins '16",
+      "rate": 5.0,
+      "original_amount": 4000.0,
+      "snapshot_principal": 0.0,
+      "snapshot_accrued": 0.0,
+      "snapshot_at": "2025-03-14T00:00:00",
+      "status": "eliminated",
+      "eliminated_on": "2025-03-14",
+      "note": "First kill."
+    }
+  ],
+
+  "payments": [
+    {
+      "id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "loan_id": "22222222-2222-2222-2222-222222222222",
+      "amount": 450.0,
+      "date": "2026-07-15",
+      "note": ""
+    }
+  ],
+
+  "snapshot_history": [
+    {
+      "at": "2026-07-01T00:00:00",
+      "loan_id": "22222222-2222-2222-2222-222222222222",
+      "principal": 18250.0,
+      "accrued": 41.18
+    }
+  ],
+
+  "monthly_minimum": 400.0
+}

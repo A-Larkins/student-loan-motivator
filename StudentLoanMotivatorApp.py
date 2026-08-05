@@ -69,22 +69,31 @@ QUOTE_ROTATION_SECONDS = 240
 # ---------------------------------------------------------------------------
 # Theme - ember to emerald. The accent color is computed live from payoff
 # progress, so the app literally warms up as the debt dies.
+#
+# The dashboard is drawn on a single canvas rather than assembled from Tk
+# widgets: Aqua overrides half of what you ask a native widget for, and the
+# panels here want rounded corners, arcs, and hover states that no Tk widget
+# offers. Canvas items also don't reflow the window, so a full repaint every
+# second is calm - the old widget-per-row build strobed once a second.
 # ---------------------------------------------------------------------------
 
-THEME_BG = "#120a0c"
-THEME_PANEL = "#241016"
-THEME_PANEL_ALT = "#31161d"
-THEME_BORDER = "#7a2b36"
+THEME_BG = "#0d0709"        # near-black plum, the deck itself
+THEME_PANEL = "#1c0f14"     # panel fill
+THEME_PANEL_ALT = "#2a151c"  # raised rows, track fills
+THEME_HOVER = "#3a1d26"     # row under the cursor
+THEME_BORDER = "#48212b"    # panel edge
+THEME_BORDER_HI = "#7a2b36"  # emphasized edge
 THEME_TEXT = "#fdf0e6"
 THEME_MUTED = "#c9a3a8"
 THEME_DIM = "#8d6b70"
+THEME_FAINT = "#5d454a"
 THEME_DANGER = "#f87171"
 THEME_GOOD = "#4ade80"
 THEME_WARN = "#fbbf24"
 ENTRY_BG = "#fdf4ec"
 ENTRY_FG = "#1a0b0e"
 
-INFLATION_UNDER = "#14532d"  # balance sitting below CPI - inflation's problem, not yours
+INFLATION_UNDER = "#166534"  # balance below CPI - inflation's problem, not yours
 
 ACCENT_LOW = "#ef4444"   # drowning
 ACCENT_MID = "#f59e0b"   # fighting
@@ -95,15 +104,20 @@ FONT_CARD = ("Avenir Next", 10, "bold")
 FONT_LABEL = ("Avenir Next", 9, "bold")
 FONT_BODY = ("Avenir Next", 9)
 FONT_SMALL = ("Avenir Next", 8)
-FONT_HERO = ("Menlo", 26, "bold")
+FONT_TINY = ("Avenir Next", 7, "bold")
+FONT_HERO = ("Menlo", 30, "bold")
 FONT_VALUE_L = ("Menlo", 17, "bold")
 FONT_VALUE_M = ("Menlo", 13, "bold")
+FONT_VALUE_S = ("Menlo", 11, "bold")
 FONT_MONO = ("Menlo", 9)
+FONT_MONO_S = ("Menlo", 8)
 
-WIN_WIDTH = 1180
+PANEL_PAD = 14  # inset from a panel's edge to its content
+
+WIN_WIDTH = 1240
 WIN_HEIGHT = 1020
-MIN_WIDTH = 960
-MIN_HEIGHT = 620
+MIN_WIDTH = 1000
+MIN_HEIGHT = 640
 
 DEFAULT_QUOTES = [
     "Every dollar of principal you kill never charges you rent again.",
@@ -678,36 +692,114 @@ def load_quotes() -> list[str]:
 # whole point here is that the color carries meaning.
 # ---------------------------------------------------------------------------
 
-class Bar:
-    def __init__(self, parent: tk.Widget, height: int = 16, track: str = THEME_PANEL_ALT):
-        self.canvas = tk.Canvas(parent, height=height, bg=track, highlightthickness=0, bd=0)
-        self.height = height
-        self.fraction = 0.0
-        self.color = ACCENT_MID
-        self.canvas.bind("<Configure>", lambda _e: self._draw())
+def rounded(canvas: tk.Canvas, x0: float, y0: float, x1: float, y1: float, radius: float,
+            fill: str, outline: str = "", width: int = 1, **kwargs) -> int:
+    """Rounded rectangle as a single smoothed polygon.
 
-    def grid(self, **kwargs):
-        self.canvas.grid(**kwargs)
-        return self
+    Tk has no rounded-rect primitive. Doubling each corner point and asking for
+    a spline rounds exactly the corners and leaves the edges straight, which is
+    one item per panel instead of four arcs plus two rectangles.
+    """
+    radius = max(0.0, min(radius, (x1 - x0) / 2, (y1 - y0) / 2))
+    points = [
+        x0 + radius, y0, x1 - radius, y0, x1, y0, x1, y0 + radius,
+        x1, y1 - radius, x1, y1, x1 - radius, y1, x0 + radius, y1,
+        x0, y1, x0, y1 - radius, x0, y0 + radius, x0, y0,
+    ]
+    return canvas.create_polygon(
+        points, smooth=True, splinesteps=16, fill=fill,
+        outline=outline, width=width, **kwargs
+    )
 
-    def pack(self, **kwargs):
-        self.canvas.pack(**kwargs)
-        return self
 
-    def set(self, fraction: float, color: str | None = None) -> None:
-        self.fraction = max(0.0, min(1.0, fraction))
-        if color:
-            self.color = color
-        self._draw()
+def track_bar(canvas: tk.Canvas, x: float, y: float, width: float, height: float,
+              fraction: float, color: str, track: str = THEME_PANEL_ALT, **kwargs) -> None:
+    """Pill-shaped progress bar: full-width track, fill clipped to fraction."""
+    radius = height / 2
+    rounded(canvas, x, y, x + width, y + height, radius, track, **kwargs)
+    filled = max(0.0, min(1.0, fraction)) * width
+    if filled > 1:
+        rounded(canvas, x, y, x + max(filled, height * 0.8), y + height, radius, color, **kwargs)
 
-    def _draw(self) -> None:
-        self.canvas.delete("fill")
-        width = self.canvas.winfo_width()
-        if width <= 1:
-            return
-        filled = int(width * self.fraction)
-        if filled > 0:
-            self.canvas.create_rectangle(0, 0, filled, self.height, fill=self.color, width=0, tags="fill")
+
+def donut(canvas: tk.Canvas, cx: float, cy: float, radius: float, thickness: float,
+          fraction: float, color: str, track: str = THEME_PANEL_ALT) -> None:
+    """Progress ring, drawn clockwise from twelve o'clock."""
+    box = (cx - radius, cy - radius, cx + radius, cy + radius)
+    canvas.create_arc(*box, start=0, extent=359.99, style="arc", outline=track, width=thickness)
+    sweep = max(0.0, min(1.0, fraction)) * 359.99
+    if sweep > 0.5:
+        canvas.create_arc(*box, start=90, extent=-sweep, style="arc", outline=color, width=thickness)
+
+
+class Popover:
+    """Hover detail panel - a borderless window that follows the cursor.
+
+    This is where the density comes from: rows stay one line tall, and anything
+    you'd have to widen a panel to show lives in here instead.
+    """
+
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.win = tk.Toplevel(root)
+        self.win.withdraw()
+        self.win.overrideredirect(True)
+        try:
+            self.win.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        self.frame = tk.Frame(self.win, bg=THEME_BORDER_HI, padx=1, pady=1)
+        self.frame.pack(fill="both", expand=True)
+        self.inner = tk.Frame(self.frame, bg=THEME_PANEL, padx=13, pady=11)
+        self.inner.pack(fill="both", expand=True)
+        self.title = tk.Label(self.inner, text="", font=FONT_CARD, bg=THEME_PANEL,
+                              fg=THEME_TEXT, anchor="w", justify="left")
+        self.title.pack(anchor="w")
+        self.rows = tk.Frame(self.inner, bg=THEME_PANEL)
+        self.rows.pack(anchor="w", pady=(7, 0))
+        self.rows.grid_columnconfigure(1, weight=1)
+        self.row_widgets: list[tk.Widget] = []
+        self.key = None
+
+    def show(self, key, title: str, lines: list[tuple[str, str, str]], x: int, y: int) -> None:
+        """lines is (label, value, value color). Rebuilt only when the key changes."""
+        if key != self.key:
+            self.key = key
+            self.title.configure(text=title)
+            for widget in self.row_widgets:
+                widget.destroy()
+            self.row_widgets = []
+            for i, (label, value, color) in enumerate(lines):
+                if not label and not value:  # spacer
+                    spacer = tk.Frame(self.rows, bg=THEME_PANEL, height=6)
+                    spacer.grid(row=i, column=0, columnspan=2)
+                    self.row_widgets.append(spacer)
+                    continue
+                left = tk.Label(self.rows, text=label, font=FONT_SMALL, bg=THEME_PANEL,
+                                fg=THEME_DIM, anchor="w")
+                left.grid(row=i, column=0, sticky="w", padx=(0, 18))
+                right = tk.Label(self.rows, text=value, font=FONT_MONO, bg=THEME_PANEL,
+                                 fg=color, anchor="e")
+                right.grid(row=i, column=1, sticky="e")
+                self.row_widgets.extend((left, right))
+
+        self.win.update_idletasks()
+        width = self.win.winfo_reqwidth()
+        height = self.win.winfo_reqheight()
+        # Flip to the other side of the cursor rather than run off the screen.
+        if x + width + 24 > self.root.winfo_screenwidth():
+            x -= width + 22
+        else:
+            x += 18
+        y = min(y + 16, self.root.winfo_screenheight() - height - 12)
+        self.win.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
+        self.win.deiconify()
+        self.win.lift()
+
+    def hide(self) -> None:
+        if self.key is not None:
+            self.key = None
+            self.win.withdraw()
 
 
 # ---------------------------------------------------------------------------
@@ -721,12 +813,6 @@ class StudentLoanMotivatorApp:
         self.quotes = load_quotes()
         self.current_quote = random.choice(self.quotes)
         self._quote_slot = -1
-        self.loan_rows: list[dict] = []
-        self.payment_rows: list[dict] = []
-        self.trophy_rows: list[dict] = []
-        self._kill_signature: tuple | None = None
-        self._pay_signature: tuple | None = None
-        self._trophy_signature: tuple | None = None
 
         # Bundled numbers first so the card renders instantly; the cached ones
         # win if they exist, and a live fetch overwrites both a moment later.
@@ -739,8 +825,9 @@ class StudentLoanMotivatorApp:
         root.title("Student Loan Motivator")
         root.configure(bg=THEME_BG)
         # A hard-coded size larger than the screen gets clamped by the window
-        # manager, and the squeeze lands on whichever panel has weight - which
-        # is how Kill Order ended up invisible outside fullscreen.
+        # manager. The deck lays itself out from the canvas size, so clamping is
+        # harmless now, but starting inside the screen still avoids a resize
+        # flash on launch.
         usable_w = root.winfo_screenwidth() - 60
         usable_h = root.winfo_screenheight() - 150  # menu bar + Dock
         width = max(MIN_WIDTH, min(WIN_WIDTH, usable_w))
@@ -811,61 +898,6 @@ class StudentLoanMotivatorApp:
 
     # -- chrome -----------------------------------------------------------
 
-    def card(self, parent: tk.Widget, title: str, row: int, col: int, **grid) -> tuple[tk.Frame, tk.Label]:
-        outer = tk.Frame(parent, bg=THEME_BORDER, bd=0)
-        outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=3, **grid)
-        inner = tk.Frame(outer, bg=THEME_PANEL, bd=0)
-        inner.pack(fill="both", expand=True, padx=1, pady=1)
-        header = tk.Label(
-            inner, text=title, font=FONT_CARD, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w"
-        )
-        header.pack(fill="x", padx=12, pady=(6, 3))
-        body = tk.Frame(inner, bg=THEME_PANEL)
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 7))
-        return body, header
-
-    def legend_row(self, parent: tk.Widget, row: int, color: str) -> dict:
-        """Dot + amount + explanation, one line, aligned across rows."""
-        holder = tk.Frame(parent, bg=THEME_PANEL)
-        holder.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0))
-        holder.grid_columnconfigure(2, weight=1)
-
-        tk.Label(holder, text="●", font=FONT_SMALL, bg=THEME_PANEL, fg=color).grid(
-            row=0, column=0, padx=(0, 6)
-        )
-        amount = tk.Label(holder, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_TEXT,
-                          width=11, anchor="w")
-        amount.grid(row=0, column=1, sticky="w")
-        note = tk.Label(holder, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w")
-        note.grid(row=0, column=2, sticky="w")
-        return {"amount": amount, "note": note}
-
-    def scrollable(self, parent: tk.Widget) -> tk.Frame:
-        """A vertically scrolling region that only shows its bar when needed."""
-        parent.grid_rowconfigure(0, weight=1)
-        parent.grid_columnconfigure(0, weight=1)
-
-        canvas = tk.Canvas(parent, bg=THEME_PANEL, highlightthickness=0, bd=0)
-        canvas.grid(row=0, column=0, sticky="nsew")
-        bar = tk.Scrollbar(parent, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=bar.set)
-
-        inner = tk.Frame(canvas, bg=THEME_PANEL)
-        window = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.grid_columnconfigure(0, weight=1)
-
-        def sync(_event=None) -> None:
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            if inner.winfo_reqheight() > canvas.winfo_height():
-                bar.grid(row=0, column=1, sticky="ns")
-            else:
-                bar.grid_remove()
-                canvas.yview_moveto(0)
-
-        inner.bind("<Configure>", sync)
-        canvas.bind("<Configure>", lambda e: (canvas.itemconfigure(window, width=e.width), sync()))
-        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 3 or (1 if e.delta < 0 else -1)), "units"))
-        return inner
 
     def button(self, parent: tk.Widget, text: str, command, accent: str = THEME_BORDER) -> tk.Label:
         """A Label pretending to be a button.
@@ -891,192 +923,98 @@ class StudentLoanMotivatorApp:
         return btn
 
     def build_ui(self) -> None:
+        """One canvas, one paint pass. Everything below is drawn, not packed."""
+        self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
-        # ---- header ----
-        header = tk.Frame(self.root, bg=THEME_BG)
-        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
-        header.grid_columnconfigure(1, weight=1)
+        self.deck = tk.Canvas(self.root, bg=THEME_BG, highlightthickness=0, bd=0)
+        self.deck.grid(row=0, column=0, sticky="nsew")
 
-        left = tk.Frame(header, bg=THEME_BG)
-        left.grid(row=0, column=0, sticky="w")
-        tk.Label(left, text="STUDENT LOAN MOTIVATOR", font=FONT_TITLE, bg=THEME_BG, fg=THEME_TEXT).pack(anchor="w")
-        self.quote_label = tk.Label(
-            left, text=self.current_quote, font=FONT_SMALL, bg=THEME_BG, fg=THEME_DIM, anchor="w"
-        )
-        self.quote_label.pack(anchor="w")
+        self.hotspots: list[dict] = []
+        self.hover_key: str | None = None
+        self.popover = Popover(self.root)
 
-        buttons = tk.Frame(header, bg=THEME_BG)
-        buttons.grid(row=0, column=2, sticky="e")
-        self.button(buttons, "Log Payment", self.open_payment_modal, "#166534").pack(side="left", padx=3)
-        self.button(buttons, "Monthly Snapshot", self.open_snapshot_modal, "#92400e").pack(side="left", padx=3)
-        self.button(buttons, "Manage Loans", self.open_loans_modal).pack(side="left", padx=3)
+        self.deck.bind("<Configure>", lambda _e: self.refresh_display())
+        self.deck.bind("<Motion>", self.on_hover)
+        self.deck.bind("<Button-1>", self.on_click)
+        self.deck.bind("<Leave>", self.on_leave)
 
-        # ---- hero ----
-        hero_body, _ = self.card(self.root, "TOTAL OWED RIGHT NOW", 1, 0)
-        self.root.grid_rowconfigure(1, weight=0)
-        hero_body.grid_columnconfigure(0, weight=1)
-        hero_body.grid_columnconfigure(1, weight=0)
+    # -- hit testing ------------------------------------------------------
 
-        hero_left = tk.Frame(hero_body, bg=THEME_PANEL)
-        hero_left.grid(row=0, column=0, sticky="w")
-        self.total_value = tk.Label(hero_left, text="$0.00", font=FONT_HERO, bg=THEME_PANEL, fg=THEME_TEXT)
-        self.total_value.pack(anchor="w")
-        self.total_detail = tk.Label(
-            hero_left, text="Add your loans to begin.", font=FONT_BODY, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w",
-            justify="left",
-        )
-        self.total_detail.pack(anchor="w")
+    def zone(self, x0: float, y0: float, x1: float, y1: float, key: str,
+             title: str = "", lines: list | None = None, action=None,
+             cursor: str = "") -> None:
+        """Register a rectangle for hover detail and/or click."""
+        self.hotspots.append({
+            "box": (x0, y0, x1, y1), "key": key, "title": title,
+            "lines": lines or [], "action": action, "cursor": cursor,
+        })
 
-        hero_right = tk.Frame(hero_body, bg=THEME_PANEL, cursor="hand2")
-        hero_right.grid(row=0, column=1, sticky="e")
-        freedom_title = tk.Label(hero_right, text="FREEDOM DATE", font=FONT_LABEL, bg=THEME_PANEL, fg=THEME_MUTED)
-        freedom_title.pack(anchor="e")
-        self.freedom_value = tk.Label(hero_right, text="--", font=FONT_VALUE_L, bg=THEME_PANEL, fg=THEME_WARN, cursor="hand2")
-        self.freedom_value.pack(anchor="e")
-        self.freedom_detail = tk.Label(hero_right, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_DIM, cursor="hand2")
-        self.freedom_detail.pack(anchor="e")
-        for widget in (hero_right, freedom_title, self.freedom_value, self.freedom_detail):
-            widget.bind("<Button-1>", self.open_target_modal)
+    def zone_at(self, x: float, y: float) -> dict | None:
+        for spot in reversed(self.hotspots):  # later zones sit on top
+            x0, y0, x1, y1 = spot["box"]
+            if x0 <= x <= x1 and y0 <= y <= y1:
+                return spot
+        return None
 
-        self.payoff_bar = Bar(hero_body, height=10)
-        self.payoff_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.payoff_label = tk.Label(
-            hero_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w"
-        )
-        self.payoff_label.grid(row=2, column=0, sticky="w", pady=(3, 0))
+    def on_hover(self, event) -> None:
+        spot = self.zone_at(event.x, event.y)
+        key = spot["key"] if spot else None
+        if key != self.hover_key:
+            self.hover_key = key
+            self.deck.configure(cursor=(spot or {}).get("cursor", ""))
+            self.refresh_display()  # repaint so the hovered row lights up
+        if spot and spot["lines"]:
+            self.popover.show(key, spot["title"], spot["lines"],
+                              event.x_root, event.y_root)
+        else:
+            self.popover.hide()
 
-        # The cheap tier isn't worth attacking; this is the part that is.
-        self.above_floor_label = tk.Label(
-            hero_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_WARN, anchor="e"
-        )
-        self.above_floor_label.grid(row=2, column=1, sticky="e", pady=(3, 0))
+    def on_leave(self, _event=None) -> None:
+        self.popover.hide()
+        if self.hover_key is not None:
+            self.hover_key = None
+            self.deck.configure(cursor="")
+            self.refresh_display()
 
-        # ---- body: two columns ----
-        #
-        # Everything used to stack in full-width bands, which meant Kill Order -
-        # the panel you actually work in - was last in line for leftover height
-        # and got squeezed to a couple of visible rows. Splitting the body lets
-        # the short reference cards stack down the right while Kill Order takes
-        # every pixel the left column has left.
-        body = tk.Frame(self.root, bg=THEME_BG)
-        body.grid(row=2, column=0, sticky="nsew", padx=4)
-        self.root.grid_rowconfigure(2, weight=1)
-        body.grid_columnconfigure(0, weight=3)
-        body.grid_columnconfigure(1, weight=2)
-        body.grid_rowconfigure(0, weight=1)
+    def on_click(self, event) -> None:
+        spot = self.zone_at(event.x, event.y)
+        if spot and spot["action"]:
+            self.popover.hide()
+            spot["action"]()
 
-        left_col = tk.Frame(body, bg=THEME_BG)
-        left_col.grid(row=0, column=0, sticky="nsew")
-        left_col.grid_columnconfigure(0, weight=1)
-        left_col.grid_rowconfigure(1, weight=1)
+    # -- drawing primitives -----------------------------------------------
 
-        right_col = tk.Frame(body, bg=THEME_BG)
-        right_col.grid(row=0, column=1, sticky="nsew")
-        right_col.grid_columnconfigure(0, weight=1)
-        right_col.grid_rowconfigure(2, weight=1)
+    def panel(self, x: float, y: float, w: float, h: float, title: str = "",
+              note: str = "", note_color: str = THEME_DIM,
+              accent: str | None = None) -> tuple[float, float, float]:
+        """Draw a panel, return the content origin (x, y) and usable width."""
+        c = self.deck
+        rounded(c, x, y, x + w, y + h, 13, THEME_PANEL, outline=THEME_BORDER, width=1)
+        if not title:
+            return x + PANEL_PAD, y + PANEL_PAD, w - 2 * PANEL_PAD
+        c.create_text(x + PANEL_PAD, y + 15, text=title, font=FONT_CARD,
+                      fill=THEME_MUTED, anchor="w")
+        if accent:
+            # Short underline in the live accent color - the only chrome that
+            # changes as the debt dies.
+            rounded(c, x + PANEL_PAD, y + 25, x + PANEL_PAD + 34, y + 27, 1, accent, outline="")
+        if note:
+            c.create_text(x + w - PANEL_PAD, y + 15, text=note, font=FONT_SMALL,
+                          fill=note_color, anchor="e")
+        return x + PANEL_PAD, y + 34, w - 2 * PANEL_PAD
 
-        race_body, self.race_header = self.card(left_col, "THE RACE", 0, 0)
-        race_body.grid_columnconfigure(1, weight=1)
+    def deck_button(self, x: float, y: float, text: str, accent: str, action) -> float:
+        """Rounded canvas button. Returns its left edge so callers can stack right to left."""
+        c = self.deck
+        width = 15 + 7.4 * len(text)
+        hovered = self.hover_key == f"btn:{text}"
+        fill = lerp_color(accent, "#ffffff", 0.22) if hovered else accent
+        rounded(c, x - width, y, x, y + 27, 7, fill, outline="")
+        c.create_text(x - width / 2, y + 14, text=text, font=FONT_LABEL, fill=THEME_TEXT)
+        self.zone(x - width, y, x, y + 27, f"btn:{text}", action=action, cursor="pointinghand")
+        return x - width
 
-        tk.Label(race_body, text="Interest", font=FONT_LABEL, bg=THEME_PANEL, fg=THEME_DANGER, width=9, anchor="w").grid(row=0, column=0, sticky="w")
-        self.race_interest_bar = Bar(race_body, height=16)
-        self.race_interest_bar.grid(row=0, column=1, sticky="ew", padx=6)
-        self.race_interest_value = tk.Label(race_body, text="$0.00", font=FONT_VALUE_M, bg=THEME_PANEL, fg=THEME_DANGER, width=11, anchor="e")
-        self.race_interest_value.grid(row=0, column=2, sticky="e")
-
-        tk.Label(race_body, text="You paid", font=FONT_LABEL, bg=THEME_PANEL, fg=THEME_GOOD, width=9, anchor="w").grid(row=1, column=0, sticky="w", pady=(5, 0))
-        self.race_paid_bar = Bar(race_body, height=16)
-        self.race_paid_bar.grid(row=1, column=1, sticky="ew", padx=6, pady=(5, 0))
-        self.race_paid_value = tk.Label(race_body, text="$0.00", font=FONT_VALUE_M, bg=THEME_PANEL, fg=THEME_GOOD, width=11, anchor="e")
-        self.race_paid_value.grid(row=1, column=2, sticky="e", pady=(5, 0))
-
-        # The old BLEEDING card showed the same month-interest number as the
-        # Interest bar right here, so it was two cards saying one thing. Its
-        # burn rates live on as a footnote under the bars instead.
-        self.race_burn = tk.Label(race_body, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_DIM, anchor="w")
-        self.race_burn.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-
-        self.race_verdict = tk.Label(race_body, text="", font=FONT_CARD, bg=THEME_PANEL, fg=THEME_TEXT, anchor="w")
-        self.race_verdict.grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
-        self.race_detail = tk.Label(race_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w", justify="left")
-        self.race_detail.grid(row=4, column=0, columnspan=3, sticky="w")
-
-        # ---- inflation ----
-        # Hero number is the REAL rate, not CPI - that's the thing you can't
-        # read anywhere else. The CPI figures themselves are the supporting
-        # column on the right.
-        infl_body, self.infl_header = self.card(right_col, "vs INFLATION", 0, 0)
-        infl_body.grid_columnconfigure(0, weight=1)
-        infl_body.grid_columnconfigure(1, weight=0)
-
-        infl_left = tk.Frame(infl_body, bg=THEME_PANEL)
-        infl_left.grid(row=0, column=0, sticky="sw")
-        self.infl_real = tk.Label(
-            infl_left, text="--", font=FONT_VALUE_L, bg=THEME_PANEL, fg=THEME_DANGER, anchor="w",
-        )
-        self.infl_real.pack(anchor="w")
-        self.infl_real_caption = tk.Label(
-            infl_left, text="real rate after CPI", font=FONT_SMALL, bg=THEME_PANEL,
-            fg=THEME_DIM, anchor="w",
-        )
-        self.infl_real_caption.pack(anchor="w")
-
-        self.infl_figures = tk.Label(
-            infl_body, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_MUTED,
-            anchor="e", justify="left",
-        )
-        self.infl_figures.grid(row=0, column=1, sticky="e")
-
-        # One bar, two meanings: the red fill is balance priced above CPI, the
-        # green track behind it is the balance inflation is quietly eating.
-        self.infl_bar = Bar(infl_body, height=9, track=INFLATION_UNDER)
-        self.infl_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(9, 3))
-
-        # Legend under the bar. Colored dot, amount, then what it MEANS - the
-        # first cut said "above CPI / under it" and nobody could tell what was
-        # above what.
-        self.infl_above = self.legend_row(infl_body, 2, THEME_DANGER)
-        self.infl_below = self.legend_row(infl_body, 3, THEME_GOOD)
-
-        # ---- kill order: fills whatever the left column has left ----
-        kill_body, self.kill_header = self.card(left_col, "KILL ORDER", 1, 0)
-        self.kill_container = self.scrollable(kill_body)
-        self.kill_empty = tk.Label(
-            self.kill_container,
-            text="No active loans yet - hit \"Manage Loans\" to add one.",
-            font=FONT_BODY,
-            bg=THEME_PANEL,
-            fg=THEME_DIM,
-            anchor="w",
-        )
-
-        # ---- payments + trophies stack down the right column ----
-        pay_body, self.pay_header = self.card(right_col, "PAYMENTS THIS MONTH", 1, 0)
-        pay_body.grid_columnconfigure(0, weight=1)
-        self.pay_container = tk.Frame(pay_body, bg=THEME_PANEL)
-        self.pay_container.grid(row=0, column=0, sticky="nsew")
-        self.pay_container.grid_columnconfigure(0, weight=1)
-        self.pay_empty = tk.Label(
-            self.pay_container, text="Nothing logged this month yet.", font=FONT_BODY,
-            bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
-        )
-
-        trophy_body, self.trophy_header = self.card(right_col, "ELIMINATED", 2, 0)
-        trophy_body.grid_columnconfigure(0, weight=1)
-        self.trophy_container = tk.Frame(trophy_body, bg=THEME_PANEL)
-        self.trophy_container.grid(row=0, column=0, sticky="nsew")
-        self.trophy_container.grid_columnconfigure(0, weight=1)
-        self.trophy_empty = tk.Label(
-            self.trophy_container, text="No kills yet.", font=FONT_BODY,
-            bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
-        )
-
-        # ---- footer ----
-        self.status_label = tk.Label(
-            self.root, text="", font=FONT_SMALL, bg=THEME_BG, fg=THEME_DIM, anchor="w"
-        )
-        self.status_label.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 7))
 
     def toggle_fullscreen(self, _event=None) -> None:
         self.root.attributes("-fullscreen", not bool(self.root.attributes("-fullscreen")))
@@ -1687,401 +1625,586 @@ class StudentLoanMotivatorApp:
         self.button(buttons, "Save", save, "#166534").pack(side="left", padx=4)
 
     # -- render -----------------------------------------------------------
+    #
+    # One pass, top to bottom: gather every number into a model, then draw it.
+    # Nothing is cached between frames - a canvas repaint is cheap and it means
+    # there is exactly one code path, whether the trigger was the clock, a
+    # resize, a hover, or a payment landing.
 
     def refresh_display(self) -> None:
+        if not hasattr(self, "deck"):
+            return
+        self.paint(self.build_model())
+
+    def build_model(self) -> dict:
         now = datetime.now()
         today = now.date()
+        payments = self.expanded_payments()
 
         actives = self.active_loans()
-        snapshots = [project_loan(l, self.expanded_payments(), now) for l in actives]
+        snapshots = [project_loan(l, payments, now) for l in actives]
         ordered = kill_order(snapshots)
 
         total_owed = sum(s["total"] for s in snapshots)
         total_principal = sum(s["principal"] for s in snapshots)
-        total_accrued = sum(s["accrued"] for s in snapshots)
         total_daily = sum(s["daily"] for s in snapshots)
 
         original_all = sum(max(0.0, float(l.get("original_amount", 0.0))) for l in self.data["loans"])
-        paid_off_fraction = 0.0
+        paid_fraction = 0.0
         if original_all > 0:
-            paid_off_fraction = max(0.0, min(1.0, 1.0 - (total_principal / original_all)))
-        accent = progress_accent(paid_off_fraction)
+            paid_fraction = max(0.0, min(1.0, 1.0 - (total_principal / original_all)))
 
-        # -- hero --
-        self.total_value.configure(text=money(total_owed), fg=accent if total_owed > 0 else THEME_GOOD)
-        if snapshots:
-            self.total_detail.configure(
-                text=f"{money(total_principal)} principal  +  {money(total_accrued)} accrued interest"
-                     f"     across {len(snapshots)} loan{'s' if len(snapshots) != 1 else ''}"
-            )
-        else:
-            self.total_detail.configure(text="Add your loans to begin.")
-
-        if original_all > 0:
-            self.payoff_bar.set(paid_off_fraction, accent)
-            self.payoff_label.configure(
-                text=f"{paid_off_fraction * 100:.1f}% paid off  -  {money(original_all - total_principal)} killed of {money(original_all)} borrowed"
-            )
-        else:
-            self.payoff_bar.set(0.0, THEME_PANEL_ALT)
-            self.payoff_label.configure(text="Add original loan amounts to track lifetime progress.")
-
-        split = above_floor_split(snapshots)
-        if split["count"] and split["above"] > 0:
-            self.above_floor_label.configure(
-                text=f"Above {split['floor']:.2f}%:  {money(split['above'])}"
-                     f"  -  {split['fraction'] * 100:.1f}% of the balance"
-                     f"  ({split['count']} loan{'s' if split['count'] != 1 else ''})",
-                fg=THEME_WARN,
-            )
-        elif snapshots:
-            self.above_floor_label.configure(
-                text=f"Everything left is at {split['floor']:.2f}% - the cheap tier", fg=THEME_GOOD
-            )
-        else:
-            self.above_floor_label.configure(text="")
-
+        month_payments = self.payments_in_month(today)
         pace, pace_source = self.planned_monthly()
         free_date, months = freedom_date(total_owed, blended_rate(snapshots), pace, today)
-        if total_owed <= 0 and self.data["loans"]:
-            self.freedom_value.configure(text="DEBT FREE", fg=THEME_GOOD)
-            self.freedom_detail.configure(text="")
-        elif free_date and months:
-            self.freedom_value.configure(text=free_date.strftime("%b %Y"), fg=THEME_WARN)
-            years, rem = divmod(months, 12)
-            span = f"{years}y {rem}m" if years else f"{rem} months"
-            self.freedom_detail.configure(text=f"{span} at {money(pace)}/mo {pace_source}  -  click to change")
-        else:
-            self.freedom_value.configure(text="--", fg=THEME_DIM)
-            self.freedom_detail.configure(
-                text="Click to set a monthly target" if total_owed > 0 else ""
-            )
 
-        # -- the race --
-        month_interest = sum(month_interest_for(l, self.expanded_payments(), now) for l in actives)
-        month_payments = self.payments_in_month(today)
-        month_paid = sum(p["amount"] for p in month_payments)
-        break_even = total_daily * days_in_month(today)
+        cpi = self.inflation.get("headline")
+        return {
+            "now": now, "today": today,
+            "snapshots": snapshots, "ordered": ordered,
+            "total_owed": total_owed,
+            "total_principal": total_principal,
+            "total_accrued": sum(s["accrued"] for s in snapshots),
+            "total_daily": total_daily,
+            "original_all": original_all,
+            "paid_fraction": paid_fraction,
+            "accent": progress_accent(paid_fraction),
+            "month_interest": sum(month_interest_for(l, payments, now) for l in actives),
+            "month_payments": month_payments,
+            "month_paid": sum(p["amount"] for p in month_payments),
+            "break_even": total_daily * days_in_month(today),
+            "pace": pace, "pace_source": pace_source,
+            "free_date": free_date, "months": months,
+            "blended": blended_rate(snapshots),
+            "cpi": cpi,
+            "floor": above_floor_split(snapshots),
+            "vs_cpi": inflation_verdict(snapshots, cpi) if cpi is not None else None,
+            "dead": self.eliminated_loans(),
+        }
 
-        self.race_header.configure(text=f"THE RACE  -  {today.strftime('%B %Y')}")
-        scale = max(month_interest, month_paid, break_even, 1.0)
-        self.race_interest_bar.set(month_interest / scale, THEME_DANGER)
-        self.race_paid_bar.set(month_paid / scale, THEME_GOOD)
-        self.race_interest_value.configure(text=money(month_interest))
-        self.race_paid_value.configure(text=money(month_paid))
+    def paint(self, m: dict) -> None:
+        c = self.deck
+        c.delete("all")
+        self.hotspots = []
 
-        if not snapshots:
-            self.race_verdict.configure(text="", fg=THEME_TEXT)
-            self.race_detail.configure(text="")
-        elif month_paid <= 0:
-            self.race_verdict.configure(text="NOT IN THE FIGHT YET", fg=THEME_DIM)
-            self.race_detail.configure(
-                text=f"{money(break_even)} is the rent to stand still this month. "
-                     f"Everything past it shrinks the debt."
-            )
-        elif month_paid >= break_even:
-            ahead = month_paid - break_even
-            self.race_verdict.configure(text=f"WINNING  -  {money(ahead)} into principal", fg=THEME_GOOD)
-            self.race_detail.configure(
-                text=f"Break-even was {money(break_even)}. You cleared it with {len(month_payments)} payment"
-                     f"{'s' if len(month_payments) != 1 else ''}."
-            )
-        else:
-            behind = break_even - month_paid
-            self.race_verdict.configure(text=f"LOSING  -  {money(behind)} short of break-even", fg=THEME_DANGER)
-            days_left = max(0, (month_end(today) - today).days)
-            self.race_detail.configure(
-                text=f"Break-even is {money(break_even)} this month. {days_left} day"
-                     f"{'s' if days_left != 1 else ''} left to catch up."
-            )
+        width = c.winfo_width()
+        height = c.winfo_height()
+        if width <= 1 or height <= 1:
+            return
 
-        self.race_burn.configure(
-            text=f"burning {money(total_daily)}/day  -  {money(total_daily / 24.0)}/hr"
-                 f"  -  {money(break_even)} for the full month"
-        )
+        pad, gut = 15, 11
+        y = self.paint_header(m, pad, width - 2 * pad)
+        y = self.paint_hero(m, pad, y + gut, width - 2 * pad) + gut
 
-        # -- inflation --
-        self.render_inflation(snapshots)
+        status_h = 27
+        left_w = int((width - 2 * pad - gut) * 0.58)
+        right_x = pad + left_w + gut
+        right_w = width - pad - right_x
+        bottom = height - pad - status_h
 
-        # -- kill order --
-        self.render_kill_order(ordered, accent)
+        race_h = 122
+        self.paint_race(m, pad, y, left_w, race_h)
+        self.paint_loans(m, pad, y + race_h + gut, left_w, bottom - y - race_h - gut)
 
-        # -- payments --
-        self.render_payments(month_payments, now)
-        self.pay_header.configure(text=f"PAYMENTS THIS MONTH  -  {money(month_paid)}")
+        infl_h = 196
+        self.paint_inflation(m, right_x, y, right_w, infl_h)
+        month_h = 104
+        self.paint_month(m, right_x, y + infl_h + gut, right_w, month_h)
+        self.paint_trophies(m, right_x, y + infl_h + month_h + 2 * gut, right_w,
+                            bottom - y - infl_h - month_h - 2 * gut)
 
-        # -- trophies --
-        self.render_trophies()
+        self.paint_status(m, pad, height - pad - status_h + 4, width - 2 * pad)
 
-        # -- status --
-        bits = []
-        if snapshots:
-            oldest = min(s["snapshot_at"] for s in snapshots)
-            age = (now - oldest).days
-            bits.append(f"Oldest snapshot: {oldest.strftime('%Y-%m-%d')} ({age} day{'s' if age != 1 else ''} ago)")
+    # -- bands ------------------------------------------------------------
+
+    def paint_header(self, m: dict, x: float, w: float) -> float:
+        c = self.deck
+        c.create_text(x, 20, text="STUDENT LOAN MOTIVATOR", font=FONT_TITLE,
+                      fill=THEME_TEXT, anchor="w")
+        c.create_text(x, 39, text=self.current_quote, font=FONT_SMALL,
+                      fill=THEME_DIM, anchor="w")
+
+        right = x + w
+        right = self.deck_button(right, 13, "Manage Loans", "#5b2531", self.open_loans_modal) - 7
+        right = self.deck_button(right, 13, "Monthly Snapshot", "#92400e", self.open_snapshot_modal) - 7
+        self.deck_button(right, 13, "Log Payment", "#166534", self.open_payment_modal)
+        return 52
+
+    def paint_hero(self, m: dict, x: float, y: float, w: float) -> float:
+        c = self.deck
+        h = 128
+        snapshot_note = ""
+        if m["snapshots"]:
+            oldest = min(s["snapshot_at"] for s in m["snapshots"])
+            age = (m["now"] - oldest).days
+            snapshot_note = f"snapshot {age} day{'s' if age != 1 else ''} old"
             if age >= 35:
-                bits.append("Time to re-snapshot")
-        bits.append("Data in Application Support")
-        self.status_label.configure(text="   |   ".join(bits))
+                snapshot_note += "  -  time to re-snapshot"
+        cx, cy, cw = self.panel(x, y, w, h, "TOTAL OWED RIGHT NOW", snapshot_note,
+                                THEME_WARN if "re-snapshot" in snapshot_note else THEME_FAINT,
+                                accent=m["accent"])
 
-    # Rebuilding these rows on every tick made the panel strobe once a second
-    # and left it blank for part of each frame. Build only when the underlying
-    # set actually changes; otherwise just retext what moved.
+        # Left: the number that ticks.
+        c.create_text(cx, cy + 22, text=money(m["total_owed"]), font=FONT_HERO,
+                      fill=m["accent"] if m["total_owed"] > 0 else THEME_GOOD, anchor="w")
+        if m["snapshots"]:
+            detail = (f"{money(m['total_principal'])} principal  +  {money(m['total_accrued'])} interest"
+                      f"     across {len(m['snapshots'])} loans")
+        else:
+            detail = "Add your loans to begin."
+        c.create_text(cx, cy + 48, text=detail, font=FONT_BODY, fill=THEME_MUTED, anchor="w")
 
-    def render_inflation(self, snapshots: list[dict]) -> None:
+        self.zone(cx, cy, cx + 300, cy + 58, "hero", "Where the balance sits", [
+            ("Principal", money(m["total_principal"]), THEME_TEXT),
+            ("Unpaid interest", money(m["total_accrued"]), THEME_WARN),
+            ("", "", ""),
+            ("Interest per day", money(m["total_daily"]), THEME_DANGER),
+            ("Interest per hour", money(m["total_daily"] / 24.0), THEME_DANGER),
+            ("Blended rate", f"{m['blended']:.2f}%", THEME_TEXT),
+            ("", "", ""),
+            ("Borrowed all-time", money(m["original_all"]), THEME_DIM),
+            ("Killed so far", money(m["original_all"] - m["total_principal"]), THEME_GOOD),
+        ])
+
+        # Middle: payoff ring.
+        ring_x = cx + cw * 0.56
+        ring_y = cy + 30
+        donut(c, ring_x, ring_y, 30, 7, m["paid_fraction"], m["accent"])
+        c.create_text(ring_x, ring_y - 3, text=f"{m['paid_fraction'] * 100:.0f}%",
+                      font=FONT_VALUE_M, fill=THEME_TEXT)
+        c.create_text(ring_x, ring_y + 12, text="paid off", font=FONT_TINY, fill=THEME_DIM)
+        self.zone(ring_x - 34, ring_y - 34, ring_x + 34, ring_y + 34, "ring",
+                  "Lifetime progress", [
+                      ("Borrowed", money(m["original_all"]), THEME_DIM),
+                      ("Principal left", money(m["total_principal"]), THEME_TEXT),
+                      ("Killed", money(m["original_all"] - m["total_principal"]), THEME_GOOD),
+                      ("", "", ""),
+                      ("Loans eliminated", str(len(m["dead"])), THEME_GOOD),
+                      ("Still active", str(len(m["snapshots"])), THEME_TEXT),
+                  ])
+
+        # Right: freedom date.
+        rx = cx + cw
+        c.create_text(rx, cy + 4, text="FREEDOM DATE", font=FONT_LABEL, fill=THEME_MUTED, anchor="e")
+        if m["total_owed"] <= 0 and self.data["loans"]:
+            c.create_text(rx, cy + 26, text="DEBT FREE", font=FONT_VALUE_L, fill=THEME_GOOD, anchor="e")
+            sub = ""
+        elif m["free_date"] and m["months"]:
+            c.create_text(rx, cy + 26, text=m["free_date"].strftime("%b %Y"),
+                          font=FONT_VALUE_L, fill=THEME_WARN, anchor="e")
+            years, rem = divmod(m["months"], 12)
+            span = f"{years}y {rem}m" if years else f"{rem} months"
+            sub = f"{span} at {money(m['pace'])}/mo {m['pace_source']}"
+        else:
+            c.create_text(rx, cy + 26, text="--", font=FONT_VALUE_L, fill=THEME_DIM, anchor="e")
+            sub = "click to set a monthly target"
+        c.create_text(rx, cy + 44, text=sub, font=FONT_SMALL, fill=THEME_DIM, anchor="e")
+        self.zone(rx - 210, cy, rx, cy + 52, "freedom", "Payoff projection", [
+            ("Monthly pace", money(m["pace"]), THEME_TEXT),
+            ("Source", m["pace_source"].strip("()") or "measured", THEME_DIM),
+            ("Blended rate", f"{m['blended']:.2f}%", THEME_TEXT),
+            ("Balance today", money(m["total_owed"]), THEME_TEXT),
+            ("", "", ""),
+            ("Click", "to change the target", THEME_WARN),
+        ], action=self.open_target_modal, cursor="pointinghand")
+
+        # Bottom: lifetime bar plus the above-the-floor readout.
+        bar_y = cy + 68
+        track_bar(c, cx, bar_y, cw, 9, m["paid_fraction"], m["accent"])
+        c.create_text(cx, bar_y + 22,
+                      text=f"{m['paid_fraction'] * 100:.1f}% paid off   -   "
+                           f"{money(m['original_all'] - m['total_principal'])} killed of "
+                           f"{money(m['original_all'])} borrowed",
+                      font=FONT_SMALL, fill=THEME_MUTED, anchor="w")
+
+        floor = m["floor"]
+        if floor["count"] and floor["above"] > 0:
+            text = (f"{money(floor['above'])} above {floor['floor']:.2f}%"
+                    f"   -   {floor['fraction'] * 100:.1f}% of the balance")
+            color = THEME_WARN
+            lines = [
+                ("Above the floor", money(floor["above"]), THEME_WARN),
+                ("At the floor", money(floor["at_floor"]), THEME_GOOD),
+                ("", "", ""),
+                ("Loans above", f"{floor['count']} of {len(m['snapshots'])}", THEME_TEXT),
+                ("Cheapest rate", f"{floor['floor']:.2f}%", THEME_GOOD),
+            ]
+        elif m["snapshots"]:
+            text = f"everything left is at {floor['floor']:.2f}%"
+            color = THEME_GOOD
+            lines = [("Cheapest rate", f"{floor['floor']:.2f}%", THEME_GOOD)]
+        else:
+            text, color, lines = "", THEME_DIM, []
+        if text:
+            c.create_text(cx + cw, bar_y + 22, text=text, font=FONT_SMALL, fill=color, anchor="e")
+            self.zone(cx + cw - 260, bar_y + 13, cx + cw, bar_y + 31, "floor",
+                      "Debt above the cheapest tier", lines)
+        return y + h
+
+    def paint_race(self, m: dict, x: float, y: float, w: float, h: float) -> None:
+        c = self.deck
+        cx, cy, cw = self.panel(x, y, w, h, "THE RACE",
+                                m["today"].strftime("%B %Y").upper())
+
+        # Headroom in the scale so the break-even marker lands inside the track
+        # instead of on top of the value column - break-even is usually the
+        # largest of the three.
+        scale = max(m["month_interest"], m["month_paid"], m["break_even"], 1.0) * 1.14
+        label_w, value_w = 52, 82
+        bar_w = cw - label_w - value_w - 16
+
+        for i, (label, value, color) in enumerate((
+            ("Interest", m["month_interest"], THEME_DANGER),
+            ("You paid", m["month_paid"], THEME_GOOD),
+        )):
+            row_y = cy + i * 24
+            c.create_text(cx, row_y + 6, text=label, font=FONT_LABEL, fill=color, anchor="w")
+            track_bar(c, cx + label_w, row_y, bar_w, 12, value / scale, color)
+            c.create_text(cx + cw, row_y + 6, text=money(value), font=FONT_VALUE_S,
+                          fill=color, anchor="e")
+
+        # Break-even tick crosses both bars - the line you have to clear.
+        mark = cx + label_w + bar_w * min(1.0, m["break_even"] / scale)
+        c.create_line(mark, cy - 4, mark, cy + 40, fill=THEME_TEXT, width=1, dash=(2, 2))
+        c.create_text(mark + 5, cy + 50, text=f"break-even {money(m['break_even'])}",
+                      font=FONT_TINY, fill=THEME_MUTED, anchor="w")
+
+        ahead = m["month_paid"] - m["break_even"]
+        if not m["snapshots"]:
+            verdict, color = "", THEME_TEXT
+        elif m["month_paid"] <= 0:
+            verdict, color = "NOT IN THE FIGHT YET", THEME_DIM
+        elif ahead >= 0:
+            verdict, color = f"WINNING  -  {money(ahead)} into principal", THEME_GOOD
+        else:
+            verdict, color = f"LOSING  -  {money(-ahead)} short of break-even", THEME_DANGER
+        c.create_text(cx, cy + 74, text=verdict, font=FONT_CARD, fill=color, anchor="w")
+
+        days_left = max(0, (month_end(m["today"]) - m["today"]).days)
+        c.create_text(cx + cw, cy + 74,
+                      text=f"burning {money(m['total_daily'])}/day  -  {days_left} days left",
+                      font=FONT_SMALL, fill=THEME_DIM, anchor="e")
+
+        self.zone(x, y, x + w, y + h, "race", f"The month's fight - {m['today']:%B %Y}", [
+            ("Interest accrued", money(m["month_interest"]), THEME_DANGER),
+            ("Payments logged", money(m["month_paid"]), THEME_GOOD),
+            ("Break-even", money(m["break_even"]), THEME_TEXT),
+            ("", "", ""),
+            ("Ahead by" if ahead >= 0 else "Short by", money(abs(ahead)),
+             THEME_GOOD if ahead >= 0 else THEME_DANGER),
+            ("Per day", money(m["total_daily"]), THEME_DANGER),
+            ("Per hour", money(m["total_daily"] / 24.0), THEME_DANGER),
+            ("Days left", str(days_left), THEME_TEXT),
+        ])
+
+    def paint_loans(self, m: dict, x: float, y: float, w: float, h: float) -> None:
+        c = self.deck
+        cx, cy, cw = self.panel(x, y, w, h, "KILL ORDER",
+                                "highest rate first, smallest balance breaks ties")
+        if not m["ordered"]:
+            c.create_text(cx, cy + 10, text='No active loans yet - hit "Manage Loans" to add one.',
+                          font=FONT_BODY, fill=THEME_DIM, anchor="w")
+            return
+
+        # Rows breathe into the space the panel has rather than clumping at the
+        # top of an empty box, but never so far apart that the list stops
+        # reading as one thing.
+        footer_h = 24
+        available = y + h - PANEL_PAD - footer_h - cy
+        row_h = max(30, min(40, available / max(1, len(m["ordered"]))))
+        fits = max(1, int(available // row_h))
+        shown = m["ordered"][:fits]
+        cpi = m["cpi"]
+
+        for i, snap in enumerate(shown):
+            row_y = cy + i * row_h
+            key = f"loan:{snap['id']}"
+            hovered = self.hover_key == key
+            is_target = i == 0
+            if hovered or is_target:
+                rounded(c, cx - 6, row_y - 2, cx + cw + 6, row_y + row_h - 6, 7,
+                        THEME_HOVER if hovered else THEME_PANEL_ALT, outline="")
+
+            if is_target:
+                rounded(c, cx, row_y + 3, cx + 48, row_y + 17, 4, THEME_WARN, outline="")
+                c.create_text(cx + 24, row_y + 10, text="TARGET", font=FONT_TINY, fill=ENTRY_FG)
+            else:
+                c.create_text(cx + 24, row_y + 10, text=f"#{i + 1}", font=FONT_LABEL,
+                              fill=THEME_FAINT)
+
+            c.create_text(cx + 60, row_y + 10, text=snap["name"], font=FONT_CARD,
+                          fill=THEME_TEXT, anchor="w")
+
+            rate_color = THEME_DANGER if (cpi is not None and snap["rate"] > cpi) else THEME_GOOD
+            c.create_text(cx + 208, row_y + 10, text=f"{snap['rate']:.2f}%", font=FONT_MONO,
+                          fill=rate_color, anchor="w")
+            c.create_text(cx + 262, row_y + 10, text=f"{money(snap['daily'])}/day",
+                          font=FONT_MONO_S, fill=THEME_FAINT, anchor="w")
+
+            # Right side: balance, then a slim progress pill.
+            pill_w = 74
+            c.create_text(cx + cw - pill_w - 46, row_y + 10, text=money(snap["total"]),
+                          font=FONT_VALUE_S, fill=THEME_TEXT, anchor="e")
+            if snap["original"] > 0:
+                done = max(0.0, min(1.0, 1.0 - snap["principal"] / snap["original"]))
+                track_bar(c, cx + cw - pill_w - 34, row_y + 6, pill_w, 6, done,
+                          progress_accent(done))
+                c.create_text(cx + cw, row_y + 10, text=f"{done * 100:.0f}%",
+                              font=FONT_MONO_S, fill=THEME_DIM, anchor="e")
+
+            real = snap["rate"] - cpi if cpi is not None else None
+            self.zone(cx - 6, row_y - 2, cx + cw + 6, row_y + row_h - 6, key, snap["name"], [
+                ("Principal", money(snap["principal"]), THEME_TEXT),
+                ("Unpaid interest", money(snap["accrued"]), THEME_WARN),
+                ("Balance", money(snap["total"]), THEME_TEXT),
+                ("", "", ""),
+                ("Rate", f"{snap['rate']:.2f}%", rate_color),
+                ("Real rate vs CPI", f"{real:+.2f}%" if real is not None else "--",
+                 THEME_DANGER if (real or 0) > 0 else THEME_GOOD),
+                ("Costs you", f"{money(snap['daily'])}/day", THEME_DANGER),
+                ("This month", money(snap["daily"] * days_in_month(m["today"])), THEME_DANGER),
+                ("", "", ""),
+                ("Originally", money(snap["original"]) if snap["original"] else "not set", THEME_DIM),
+                ("Paid off", f"{(1 - snap['principal'] / snap['original']) * 100:.1f}%"
+                 if snap["original"] > 0 else "--", THEME_GOOD),
+                ("Snapshot", snap["snapshot_at"].strftime("%Y-%m-%d"), THEME_DIM),
+            ], action=self.open_payment_modal, cursor="pointinghand")
+
+        if len(m["ordered"]) > len(shown):
+            c.create_text(cx, cy + len(shown) * row_h + 8,
+                          text=f"+ {len(m['ordered']) - len(shown)} more - resize the window",
+                          font=FONT_SMALL, fill=THEME_DIM, anchor="w")
+
+        # Footer pinned to the panel: what the current target is actually worth.
+        target = m["ordered"][0]
+        foot_y = y + h - PANEL_PAD - 4
+        c.create_text(cx, foot_y,
+                      text=f"Kill {target['name']} and you stop paying "
+                           f"{money(target['daily'] * 365.25 / 12)}/mo in interest on it",
+                      font=FONT_SMALL, fill=THEME_DIM, anchor="w")
+        c.create_text(cx + cw, foot_y,
+                      text=f"{len(m['ordered'])} active  -  {money(m['total_daily'])}/day total",
+                      font=FONT_SMALL, fill=THEME_FAINT, anchor="e")
+
+    def paint_inflation(self, m: dict, x: float, y: float, w: float, h: float) -> None:
+        c = self.deck
         figures = self.inflation
-        cpi = figures.get("headline")
+        stamp = f"CPI-U {figures.get('as_of', '--')}"
+        if not figures.get("live"):
+            stamp += "  (offline)"
+        cx, cy, cw = self.panel(x, y, w, h, "vs INFLATION", stamp)
 
-        # Two by two, padded to fixed widths so the mono columns line up on the
-        # decimal point. Four figures in two lines instead of four - vertical
-        # space in this window belongs to Kill Order.
-        def cell(label: str, value: float | None, width: int) -> str:
-            return f"{label:<{width}}" + (f"{value:5.2f}%" if value is not None else "   --")
+        cpi = m["cpi"]
+        if cpi is None or not m["snapshots"]:
+            c.create_text(cx, cy + 12, text="No CPI data yet.", font=FONT_BODY,
+                          fill=THEME_DIM, anchor="w")
+            return
 
+        split = m["vs_cpi"]
+        real = split["real_blended"]
+        real_color = THEME_DANGER if real > 0 else THEME_GOOD
+        c.create_text(cx, cy + 12, text=f"{real:+.2f}%", font=FONT_VALUE_L,
+                      fill=real_color, anchor="w")
+        c.create_text(cx, cy + 32, text=f"{m['blended']:.2f}% blended  -  {cpi:.2f}% CPI",
+                      font=FONT_SMALL, fill=THEME_DIM, anchor="w")
+        self.zone(cx, cy, cx + 130, cy + 40, "real", "Real cost of the debt", [
+            ("Your blended rate", f"{m['blended']:.2f}%", THEME_TEXT),
+            ("Headline CPI", f"{cpi:.2f}%", THEME_TEXT),
+            ("Real rate", f"{real:+.2f}%", real_color),
+            ("", "", ""),
+            ("Meaning", "above zero costs you" if real > 0 else "below zero: inflation pays",
+             real_color),
+        ])
+
+        # The four CPI figures, right-aligned in two mono columns.
         pairs = (
             (("headline 12-mo", figures.get("headline")), ("3-mo ann.", figures.get("headline_3mo"))),
             (("core 12-mo", figures.get("core")), ("6-mo ann.", figures.get("headline_6mo"))),
         )
-        self.infl_figures.configure(text="\n".join(
-            f"{cell(*left, 15)}   {cell(*right, 11)}" for left, right in pairs
-        ))
-
-        stamp = f"CPI-U  {figures.get('as_of', '--')}"
-        if not figures.get("live"):
-            stamp += "  (offline)"
-        self.infl_header.configure(text=f"vs INFLATION  -  {stamp}")
-
-        if cpi is None or not snapshots:
-            self.infl_real.configure(text="--", fg=THEME_DIM)
-            self.infl_real_caption.configure(text="add loans to compare")
-            self.infl_bar.set(0.0, THEME_PANEL_ALT)
-            for legend in (self.infl_above, self.infl_below):
-                legend["amount"].configure(text="")
-                legend["note"].configure(text="")
-            return
-
-        split = inflation_verdict(snapshots, cpi)
-        real = split["real_blended"]
-        blended = blended_rate(snapshots)
-        self.infl_real.configure(
-            text=f"{real:+.2f}%", fg=THEME_DANGER if real > 0 else THEME_GOOD
+        # Stat strip: value over label, centered per column. Side-by-side
+        # label/value columns kept colliding as soon as the window narrowed.
+        stats = (
+            ("headline", figures.get("headline")),
+            ("core", figures.get("core")),
+            ("3-mo ann.", figures.get("headline_3mo")),
+            ("6-mo ann.", figures.get("headline_6mo")),
         )
-        # Spell out the arithmetic - a bare "+0.37%" doesn't say where it came from.
-        self.infl_real_caption.configure(text=f"{blended:.2f}% blended - {cpi:.2f}% CPI")
+        strip_x = cx + 140
+        strip_w = cx + cw - strip_x
+        step = strip_w / len(stats)
+        for i, (label, value) in enumerate(stats):
+            mid = strip_x + step * (i + 0.5)
+            c.create_text(mid, cy + 10, text=f"{value:.2f}%" if value is not None else "--",
+                          font=FONT_MONO, fill=THEME_MUTED)
+            c.create_text(mid, cy + 26, text=label, font=FONT_TINY, fill=THEME_FAINT)
+        self.zone(strip_x - 8, cy - 4, cx + cw, cy + 34, "cpi", "Consumer Price Index", [
+            ("Headline, 12-mo", f"{figures.get('headline', 0):.2f}%", THEME_TEXT),
+            ("Core, 12-mo", f"{figures.get('core', 0):.2f}%", THEME_TEXT),
+            ("Headline, 3-mo ann.", f"{figures.get('headline_3mo', 0):.2f}%", THEME_MUTED),
+            ("Headline, 6-mo ann.", f"{figures.get('headline_6mo', 0):.2f}%", THEME_MUTED),
+            ("", "", ""),
+            ("As of", str(figures.get("as_of", "--")), THEME_DIM),
+            ("Source", "BLS, live" if figures.get("live") else "bundled fallback", THEME_DIM),
+            ("12-mo basis", "not seasonally adj.", THEME_DIM),
+            ("Annualized basis", "seasonally adj.", THEME_DIM),
+        ])
 
-        self.infl_bar.set(split["fraction"], THEME_DANGER)
+        # Rate ladder: every loan placed on a rate axis, CPI drawn as the line
+        # that decides which side of the fight it's on.
+        axis_y = cy + 104
+        axis_x0, axis_x1 = cx + 6, cx + cw - 6
+        top_rate = max([s["rate"] for s in m["snapshots"]] + [cpi]) * 1.15 or 1.0
 
-        above_n, below_n = split["above_count"], split["below_count"]
-        self.infl_above["amount"].configure(text=money(split["above"]) if above_n else "")
-        self.infl_above["note"].configure(
-            text=f"on {above_n} loan{'s' if above_n != 1 else ''} priced over {cpi:.2f}% - really costing you"
-            if above_n else ""
-        )
-        self.infl_below["amount"].configure(text=money(split["below"]) if below_n else "")
-        self.infl_below["note"].configure(
-            text=f"on {below_n} loan{'s' if below_n != 1 else ''} under {cpi:.2f}% - inflation eats these"
-            if below_n else ""
-        )
+        def rate_x(rate: float) -> float:
+            return axis_x0 + (axis_x1 - axis_x0) * min(1.0, rate / top_rate)
 
-    def render_kill_order(self, ordered: list[dict], accent: str) -> None:
-        signature = tuple(s["id"] for s in ordered)
-        if signature != self._kill_signature:
-            self.build_kill_rows(ordered)
-            self._kill_signature = signature
+        c.create_line(axis_x0, axis_y, axis_x1, axis_y, fill=THEME_BORDER, width=1)
+        for tick in range(0, int(top_rate) + 1):
+            tx = rate_x(tick)
+            c.create_line(tx, axis_y, tx, axis_y + 4, fill=THEME_BORDER, width=1)
+            c.create_text(tx, axis_y + 12, text=f"{tick}%", font=FONT_TINY, fill=THEME_FAINT)
 
-        for snap, row in zip(ordered, self.loan_rows):
-            row["name"].configure(text=snap["name"])
-            row["detail"].configure(text=f"{snap['rate']:.2f}%   {money(snap['daily'])}/day")
-            row["total"].configure(text=money(snap["total"]))
-            if row["bar"] is not None and snap["original"] > 0:
-                done = max(0.0, min(1.0, 1.0 - snap["principal"] / snap["original"]))
-                row["bar"].set(done, progress_accent(done))
-                row["pct"].configure(text=f"{done * 100:.0f}%")
+        cpi_x = rate_x(cpi)
+        c.create_line(cpi_x, axis_y - 54, cpi_x, axis_y + 5, fill=THEME_TEXT, width=1, dash=(3, 3))
+        c.create_text(cpi_x, axis_y - 62, text=f"CPI {cpi:.2f}%", font=FONT_TINY,
+                      fill=THEME_TEXT)
 
-    def build_kill_rows(self, ordered: list[dict]) -> None:
-        for row in self.loan_rows:
-            row["frame"].destroy()
-        self.loan_rows = []
+        biggest = max(s["total"] for s in m["snapshots"]) or 1.0
+        # Loans at the same rate would stack into one blob (a sub/unsub pair
+        # always shares a rate), so nudge each repeat up a row.
+        seen: dict[int, int] = {}
+        for snap in sorted(m["snapshots"], key=lambda s: -s["total"]):
+            dot_x = rate_x(snap["rate"])
+            radius = 4 + 9 * math.sqrt(snap["total"] / biggest)
+            bucket = int(dot_x / 14)
+            level = seen.get(bucket, 0)
+            seen[bucket] = level + 1
+            dot_y = axis_y - 21 - level * 15
+            above = snap["rate"] > cpi
+            color = THEME_DANGER if above else THEME_GOOD
+            key = f"dot:{snap['id']}"
+            if self.hover_key == key:
+                c.create_oval(dot_x - radius - 3, dot_y - radius - 3,
+                              dot_x + radius + 3, dot_y + radius + 3,
+                              outline=THEME_TEXT, width=1)
+            c.create_oval(dot_x - radius, dot_y - radius, dot_x + radius, dot_y + radius,
+                          fill=color, outline=THEME_PANEL, width=1)
+            self.zone(dot_x - radius - 2, dot_y - radius - 2, dot_x + radius + 2,
+                      dot_y + radius + 2, key, snap["name"], [
+                          ("Balance", money(snap["total"]), THEME_TEXT),
+                          ("Rate", f"{snap['rate']:.2f}%", color),
+                          ("CPI", f"{cpi:.2f}%", THEME_TEXT),
+                          ("Real rate", f"{snap['rate'] - cpi:+.2f}%", color),
+                          ("", "", ""),
+                          ("Verdict", "costs you in real terms" if above
+                           else "inflation outruns it", color),
+                      ])
 
-        if not ordered:
-            self.kill_empty.grid(row=0, column=0, sticky="w", pady=4)
-            self.kill_header.configure(text="KILL ORDER")
-            return
-        self.kill_empty.grid_forget()
-        self.kill_header.configure(text="KILL ORDER  -  highest rate first, smallest balance breaks ties")
+        # Legend doubles as the above/below split.
+        legend_y = axis_y + 30
+        for i, (color, amount, count, note) in enumerate((
+            (THEME_DANGER, split["above"], split["above_count"], f"priced over {cpi:.2f}%"),
+            (INFLATION_UNDER, split["below"], split["below_count"], f"under {cpi:.2f}%"),
+        )):
+            if not count:
+                continue
+            row_y = legend_y + i * 17
+            c.create_oval(cx + 2, row_y - 3, cx + 8, row_y + 3,
+                          fill=THEME_GOOD if i else color, outline="")
+            c.create_text(cx + 16, row_y, text=money(amount), font=FONT_MONO,
+                          fill=THEME_TEXT, anchor="w")
+            c.create_text(cx + 96, row_y,
+                          text=f"on {count} loan{'s' if count != 1 else ''} {note}",
+                          font=FONT_SMALL, fill=THEME_MUTED, anchor="w")
 
-        # One line per loan. Two-line rows ran 61px each, which pushed the panel
-        # past what fits on screen once the other cards took their share.
-        for i, snap in enumerate(ordered):
-            is_target = i == 0
-            bg = THEME_PANEL_ALT if is_target else THEME_PANEL
-            frame = tk.Frame(self.kill_container, bg=bg)
-            frame.grid(row=i, column=0, sticky="ew", pady=1)
-            frame.grid_columnconfigure(2, weight=1)
+    def paint_month(self, m: dict, x: float, y: float, w: float, h: float) -> None:
+        c = self.deck
+        cx, cy, cw = self.panel(x, y, w, h, "PAYMENTS THIS MONTH", money(m["month_paid"]),
+                                THEME_GOOD if m["month_paid"] > 0 else THEME_DIM)
 
-            tk.Label(
-                frame, text="TARGET" if is_target else f"#{i + 1}", font=FONT_LABEL,
-                bg=THEME_WARN if is_target else bg,
-                fg=ENTRY_FG if is_target else THEME_DIM, width=7,
-            ).grid(row=0, column=0, padx=(8, 11), pady=2)
-
-            name = tk.Label(frame, text="", font=FONT_CARD, bg=bg, fg=THEME_TEXT,
-                            anchor="w", width=16)
-            name.grid(row=0, column=1, sticky="w")
-
-            # Fixed width, or a narrow window trims the "/day" off the end.
-            detail = tk.Label(frame, text="", font=FONT_MONO, bg=bg, fg=THEME_MUTED,
-                              anchor="w", width=17)
-            detail.grid(row=0, column=2, sticky="w")
-
-            total = tk.Label(frame, text="", font=FONT_VALUE_M, bg=bg, fg=THEME_TEXT,
-                             anchor="e", width=11)
-            total.grid(row=0, column=3, sticky="e", padx=(8, 10))
-
-            bar = pct = None
-            if snap["original"] > 0:
-                holder = tk.Frame(frame, bg=bg)
-                holder.grid(row=0, column=4, sticky="e", padx=(0, 11))
-                bar = Bar(holder, height=6)
-                bar.canvas.configure(width=64)
-                bar.pack(side="left")
-                pct = tk.Label(holder, text="", font=FONT_SMALL, bg=bg, fg=THEME_DIM,
-                               width=4, anchor="e")
-                pct.pack(side="left", padx=(6, 0))
-
-            self.loan_rows.append(
-                {"frame": frame, "name": name, "detail": detail, "total": total,
-                 "bar": bar, "pct": pct}
-            )
-
-    def render_payments(self, month_payments: list[dict], now: datetime) -> None:
-        shown = sorted(month_payments, key=lambda p: p["date"], reverse=True)[:5]
-        signature = tuple(p["id"] for p in shown) + (len(month_payments),)
-        if signature != self._pay_signature:
-            self.build_payment_rows(shown, len(month_payments))
-            self._pay_signature = signature
-
+        shown = sorted(m["month_payments"], key=lambda p: p["date"], reverse=True)
         if not shown:
+            c.create_text(cx, cy + 10, text="Nothing logged this month yet.",
+                          font=FONT_BODY, fill=THEME_DIM, anchor="w")
+            self.zone(x, y, x + w, y + h, "month", "This month", [
+                ("Break-even", money(m["break_even"]), THEME_TEXT),
+                ("Paid so far", money(0), THEME_DIM),
+                ("", "", ""),
+                ("Click", "to log a payment", THEME_GOOD),
+            ], action=self.open_payment_modal, cursor="pointinghand")
             return
 
-        # An account payment lands as several synthetic rows; sum them back into
-        # the single payment actually made.
-        expanded = self.expanded_payments()
-        allocations: dict[str, dict] = {}
-        for loan in self.data["loans"]:
-            snap = project_loan(loan, expanded, now)
-            for applied in snap["payments_applied"]:
-                origin = applied["payment"].get("parent_id") or applied["payment"]["id"]
-                slot = allocations.setdefault(origin, {"to_interest": 0.0, "to_principal": 0.0})
-                slot["to_interest"] += applied["to_interest"]
-                slot["to_principal"] += applied["to_principal"]
+        row_h = 21
+        fits = max(1, int((y + h - PANEL_PAD - cy) // row_h))
+        for i, payment in enumerate(shown[:fits]):
+            row_y = cy + i * row_h
+            loan = self.loan_by_id(payment.get("loan_id", ""))
+            c.create_text(cx, row_y + 7, text=parse_date_str(payment["date"]).strftime("%m/%d"),
+                          font=FONT_MONO_S, fill=THEME_DIM, anchor="w")
+            c.create_text(cx + 42, row_y + 7, text=money(payment["amount"]),
+                          font=FONT_VALUE_S, fill=THEME_GOOD, anchor="w")
+            c.create_text(cx + cw, row_y + 7, text=loan["name"] if loan else "whole account",
+                          font=FONT_SMALL, fill=THEME_MUTED, anchor="e")
+        if len(shown) > fits:
+            c.create_text(cx, cy + fits * row_h + 6,
+                          text=f"+ {len(shown) - fits} more", font=FONT_SMALL,
+                          fill=THEME_DIM, anchor="w")
+        self.zone(x, y, x + w, y + h, "month", "This month", [
+            ("Payments", str(len(shown)), THEME_TEXT),
+            ("Total paid", money(m["month_paid"]), THEME_GOOD),
+            ("Break-even", money(m["break_even"]), THEME_TEXT),
+            ("", "", ""),
+            ("Into principal", money(max(0.0, m["month_paid"] - m["break_even"])), THEME_GOOD),
+            ("Click", "to log another", THEME_GOOD),
+        ], action=self.open_payment_modal, cursor="pointinghand")
 
-        for payment, row in zip(shown, self.payment_rows):
-            loan = self.loan_by_id(payment["loan_id"])
-            if loan:
-                name = loan["name"]
-            elif payment.get("loan_id"):
-                name = "(deleted loan)"
-            else:
-                name = ""  # account-wide; the amount already says everything
-            applied = allocations.get(payment["id"])
-            if applied:
-                split = (
-                    f"{money(applied['to_interest'])} interest"
-                    f" / {money(applied['to_principal'])} principal"
-                )
-                name = f"{name}   {split}" if name else split
-            row["target"].configure(text=name)
-
-    def build_payment_rows(self, shown: list[dict], total_count: int) -> None:
-        for row in self.payment_rows:
-            row["frame"].destroy()
-        self.payment_rows = []
-
-        if not shown:
-            self.pay_empty.grid(row=0, column=0, sticky="w", pady=4)
-            return
-        self.pay_empty.grid_forget()
-
-        for i, payment in enumerate(shown):
-            frame = tk.Frame(self.pay_container, bg=THEME_PANEL)
-            frame.grid(row=i, column=0, sticky="ew", pady=2)
-            frame.grid_columnconfigure(2, weight=1)
-
-            tk.Label(
-                frame, text=parse_date_str(payment["date"]).strftime("%m/%d"),
-                font=FONT_MONO, bg=THEME_PANEL, fg=THEME_DIM, width=6, anchor="w",
-            ).grid(row=0, column=0, sticky="w")
-            tk.Label(
-                frame, text=money(payment["amount"]), font=FONT_VALUE_M, bg=THEME_PANEL,
-                fg=THEME_GOOD, width=10, anchor="w",
-            ).grid(row=0, column=1, sticky="w", padx=(6, 12))
-
-            target = tk.Label(frame, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w")
-            target.grid(row=0, column=2, sticky="w")
-            self.payment_rows.append({"frame": frame, "target": target})
-
-        if total_count > len(shown):
-            more = tk.Frame(self.pay_container, bg=THEME_PANEL)
-            more.grid(row=len(shown), column=0, sticky="w", pady=(5, 0))
-            tk.Label(
-                more, text=f"+ {total_count - len(shown)} more this month",
-                font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
-            ).pack(anchor="w")
-            self.payment_rows.append({"frame": more, "target": tk.Label(more)})
-
-    def render_trophies(self) -> None:
-        dead = self.eliminated_loans()
-        signature = tuple(l["id"] for l in dead)
-        if signature == self._trophy_signature:
-            return
-        self._trophy_signature = signature
-
-        for row in self.trophy_rows:
-            row.destroy()
-        self.trophy_rows = []
-
-        if not dead:
-            self.trophy_empty.grid(row=0, column=0, sticky="w", pady=4)
-            self.trophy_header.configure(text="ELIMINATED")
-            return
-        self.trophy_empty.grid_forget()
-
+    def paint_trophies(self, m: dict, x: float, y: float, w: float, h: float) -> None:
+        c = self.deck
+        dead = m["dead"]
         killed = sum(max(0.0, float(l.get("original_amount", 0.0))) for l in dead)
-        self.trophy_header.configure(
-            text=f"ELIMINATED  -  {len(dead)} down"
-                 + (f", {money(killed)} borrowed" if killed > 0 else "")
-        )
+        cx, cy, cw = self.panel(x, y, w, h, "ELIMINATED",
+                                f"{len(dead)} down" if dead else "")
+        if not dead:
+            c.create_text(cx, cy + 10, text="No kills yet.", font=FONT_BODY,
+                          fill=THEME_DIM, anchor="w")
+            return
 
-        # Newest kills first, capped - the count and total are in the header,
-        # and this card must not outgrow the panel you actually work in.
-        shown = sorted(dead, key=lambda l: str(l.get("eliminated_on") or ""), reverse=True)[:3]
-        for i, loan in enumerate(shown):
-            frame = tk.Frame(self.trophy_container, bg=THEME_PANEL)
-            frame.grid(row=i, column=0, sticky="ew", pady=2)
-            frame.grid_columnconfigure(1, weight=1)
+        row_h = 22
+        fits = max(1, int((y + h - PANEL_PAD - cy) // row_h))
+        order = sorted(dead, key=lambda l: str(l.get("eliminated_on") or ""), reverse=True)
+        for i, loan in enumerate(order[:fits]):
+            row_y = cy + i * row_h
+            rounded(c, cx, row_y, cx + 46, row_y + 15, 4, "#166534", outline="")
+            c.create_text(cx + 23, row_y + 8, text="KILLED", font=FONT_TINY, fill=THEME_TEXT)
+            c.create_text(cx + 58, row_y + 8, text=loan["name"], font=FONT_SMALL,
+                          fill=THEME_MUTED, anchor="w")
+            c.create_text(cx + cw, row_y + 8, text=loan.get("eliminated_on") or "",
+                          font=FONT_MONO_S, fill=THEME_FAINT, anchor="e")
+        if len(order) > fits:
+            c.create_text(cx, cy + fits * row_h + 6, text=f"+ {len(order) - fits} earlier",
+                          font=FONT_SMALL, fill=THEME_DIM, anchor="w")
 
-            tk.Label(
-                frame, text="KILLED", font=FONT_SMALL, bg="#166534", fg=THEME_TEXT, width=8, pady=1,
-            ).grid(row=0, column=0, padx=(0, 11))
-            tk.Label(
-                frame, text=loan["name"], font=(FONT_SMALL[0], FONT_SMALL[1], "overstrike"),
-                bg=THEME_PANEL, fg=THEME_MUTED, anchor="w",
-            ).grid(row=0, column=1, sticky="w")
-            tk.Label(
-                frame, text=loan.get("eliminated_on") or "", font=FONT_SMALL,
-                bg=THEME_PANEL, fg=THEME_DIM, anchor="e",
-            ).grid(row=0, column=2, sticky="e")
-            self.trophy_rows.append(frame)
+        self.zone(x, y, x + w, y + h, "dead", "Loans killed", [
+            ("Eliminated", str(len(dead)), THEME_GOOD),
+            ("Borrowed on them", money(killed), THEME_TEXT),
+            ("", "", ""),
+            ("Still active", str(len(m["snapshots"])), THEME_TEXT),
+            ("Next target", m["ordered"][0]["name"] if m["ordered"] else "--", THEME_WARN),
+        ])
 
-        if len(dead) > len(shown):
-            more = tk.Label(
-                self.trophy_container, text=f"+ {len(dead) - len(shown)} earlier",
-                font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
-            )
-            more.grid(row=len(shown), column=0, sticky="w", pady=(3, 0))
-            self.trophy_rows.append(more)
-
+    def paint_status(self, m: dict, x: float, y: float, w: float) -> None:
+        c = self.deck
+        bits = []
+        if m["snapshots"]:
+            oldest = min(s["snapshot_at"] for s in m["snapshots"])
+            age = (m["now"] - oldest).days
+            bits.append(f"Oldest snapshot {oldest:%Y-%m-%d} ({age}d)")
+        bits.append("Data in Application Support")
+        bits.append("hover anything for detail")
+        c.create_text(x, y, text="   |   ".join(bits), font=FONT_SMALL,
+                      fill=THEME_FAINT, anchor="w")
+        c.create_text(x + w, y, text=f"{m['now']:%a %d %b  %H:%M:%S}", font=FONT_MONO_S,
+                      fill=THEME_FAINT, anchor="e")
     # -- loop -------------------------------------------------------------
 
     def tick(self) -> None:
@@ -2099,7 +2222,6 @@ class StudentLoanMotivatorApp:
                 while pick == self.current_quote:
                     pick = random.choice(self.quotes)
                 self.current_quote = pick
-            self.quote_label.configure(text=self.current_quote)
 
         self.refresh_display()
         self.root.after(TICK_MS, self.tick)

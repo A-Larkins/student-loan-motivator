@@ -143,6 +143,22 @@ Worth promoting these into a real `tests/` dir if the math grows.
 
 ## Log
 
+**2026-08-05 (UI rebuild)** — The dashboard is now a single canvas instead of a
+tree of frames and labels. Aqua overrides half of what you ask a native widget
+for, and the panels wanted rounded corners, a progress ring, a rate-axis plot,
+and hover states that no Tk widget offers. One `paint()` pass draws everything
+from a model dict; there is exactly one code path whether the trigger was the
+clock, a resize, a hover, or a payment landing.
+
+Density now comes from hover rather than layout: every panel, loan row, and
+ladder dot registers a rectangle in a hotspot list, and a borderless popover
+follows the cursor with the detail that used to need its own column. Rows stay
+one line tall as a result.
+
+Also settled the vertical fight for good - panels are placed by arithmetic from
+the canvas size, so no widget can win height at Kill Order's expense the way the
+grid weights kept letting it.
+
 **2026-08-05** — Added an "above the floor" readout to the hero card, opposite
 the lifetime-progress line: total balance on every loan priced above the cheapest
 rate tier, plus that slice as a percentage of the whole balance. The floor is

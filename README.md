@@ -123,13 +123,24 @@ interest times days in the month — the rent you owe just to not go backwards.
 Clear it and you're WINNING, with the overage stated in dollars. Don't and it
 tells you how short you are and how many days are left.
 
-**Bleeding** — interest accrued this month, plus the per-day, per-hour, and
-per-month burn rate.
+**vs Inflation** — CPI-U pulled live from the BLS public API: headline and core
+twelve-month change, plus three- and six-month annualized. Your blended rate
+minus headline CPI is the **real rate** — above zero the debt genuinely costs
+you, below zero inflation is retiring it faster than it accrues. The rate ladder
+plots every loan against the CPI line, dot size by balance, so which side of the
+line each loan sits on is a glance rather than a calculation. Figures cache for
+twelve hours and fall back to bundled values offline.
 
 **Kill Order** — loans ranked by **highest interest rate first, smallest balance
 breaking ties**. The top one wears a TARGET tag. Avalanche on rate because that's
 mathematically cheapest, snowball on balance within a rate tier so you get a kill
-sooner. Each row shows what that specific loan costs you per day.
+sooner. Each row shows what that specific loan costs you per day, and the rate is
+colored by whether it beats inflation.
+
+**Hover anything** — the dashboard is drawn on a canvas, and every panel, row,
+and dot has a detail popover behind it: per-loan principal/interest split, real
+rate, daily and monthly cost, percent paid, snapshot age. Rows stay one line tall
+because the depth lives in the hover.
 
 **Payments This Month** — every payment logged in the current calendar month,
 each broken into what went to interest versus principal.

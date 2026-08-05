@@ -18,6 +18,9 @@ import json
 import math
 import random
 import sys
+import threading
+import urllib.error
+import urllib.request
 import uuid
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -81,6 +84,8 @@ THEME_WARN = "#fbbf24"
 ENTRY_BG = "#fdf4ec"
 ENTRY_FG = "#1a0b0e"
 
+INFLATION_UNDER = "#14532d"  # balance sitting below CPI - inflation's problem, not yours
+
 ACCENT_LOW = "#ef4444"   # drowning
 ACCENT_MID = "#f59e0b"   # fighting
 ACCENT_HIGH = "#22c55e"  # winning
@@ -90,7 +95,7 @@ FONT_CARD = ("Avenir Next", 10, "bold")
 FONT_LABEL = ("Avenir Next", 9, "bold")
 FONT_BODY = ("Avenir Next", 9)
 FONT_SMALL = ("Avenir Next", 8)
-FONT_HERO = ("Menlo", 29, "bold")
+FONT_HERO = ("Menlo", 26, "bold")
 FONT_VALUE_L = ("Menlo", 17, "bold")
 FONT_VALUE_M = ("Menlo", 13, "bold")
 FONT_MONO = ("Menlo", 9)
@@ -365,6 +370,32 @@ def kill_order(snapshots: list[dict]) -> list[dict]:
     return sorted(snapshots, key=lambda s: (-s["rate"], s["total"]))
 
 
+def above_floor_split(snapshots: list[dict]) -> dict:
+    """Balance sitting above the cheapest rate tier, and its share of the total.
+
+    The floor is read from the loans rather than pinned to 2.75% so it follows
+    the data - kill the cheap tier and the floor rises on its own. Loans within
+    a hundredth of a point of the lowest rate count as the same tier, which is
+    how the 2.75% pair reads as one floor instead of two.
+    """
+    total = sum(s["total"] for s in snapshots)
+    if not snapshots or total <= 0:
+        return {"floor": 0.0, "above": 0.0, "at_floor": 0.0, "total": total,
+                "fraction": 0.0, "count": 0}
+
+    floor = min(s["rate"] for s in snapshots)
+    above = [s for s in snapshots if s["rate"] > floor + 0.005]
+    above_total = sum(s["total"] for s in above)
+    return {
+        "floor": floor,
+        "above": above_total,
+        "at_floor": total - above_total,
+        "total": total,
+        "fraction": above_total / total,
+        "count": len(above),
+    }
+
+
 def blended_rate(snapshots: list[dict]) -> float:
     total = sum(s["principal"] for s in snapshots)
     if total <= 0:
@@ -392,6 +423,147 @@ def freedom_date(balance: float, rate_pct: float, monthly_payment: float, today:
 
 
 # ---------------------------------------------------------------------------
+# Inflation
+#
+# A 2.75% loan while prices rise 3.5% isn't really costing 2.75% - it's being
+# repaid in dollars worth less than the ones borrowed, so the real rate is
+# negative and time is on your side. Above the CPI line the opposite is true.
+#
+# Numbers come straight from the BLS public API: no key, no dependency, stdlib
+# urllib. Series used:
+#
+#   CUUR0000SA0     headline CPI-U, not seasonally adjusted
+#   CUUR0000SA0L1E  core CPI-U (less food and energy), NSA
+#   CUSR0000SA0     headline, seasonally adjusted
+#   CUSR0000SA0L1E  core, seasonally adjusted
+#
+# Twelve-month changes read off the NSA series because that IS the published
+# headline number. The 3- and 6-month annualized figures read off the SA series
+# instead - over a short window NSA data is mostly seasonality, which is how you
+# get a "6.2% inflation" reading in a 3.5% year.
+# ---------------------------------------------------------------------------
+
+BLS_API_URL = "https://api.bls.gov/publicAPI/v1/timeseries/data/"
+CPI_HEADLINE = "CUUR0000SA0"
+CPI_CORE = "CUUR0000SA0L1E"
+CPI_HEADLINE_SA = "CUSR0000SA0"
+CPI_CORE_SA = "CUSR0000SA0L1E"
+INFLATION_TIMEOUT = 8.0
+INFLATION_MAX_AGE_HOURS = 12.0
+
+# Bundled fallback so the card is never blank offline. Overwritten in the data
+# file the first time BLS answers.
+FALLBACK_INFLATION = {
+    "headline": 3.53,
+    "core": 2.59,
+    "headline_3mo": 2.78,
+    "headline_6mo": 4.05,
+    "core_3mo": 2.29,
+    "as_of": "Jun 2026",
+    "live": False,
+    "fetched_at": "",
+}
+
+MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _cpi_points(series: dict) -> dict[tuple[int, int], float]:
+    """(year, month) -> index value, skipping anything unpublished."""
+    points: dict[tuple[int, int], float] = {}
+    for row in series.get("data", []):
+        period = str(row.get("period", ""))
+        if not period.startswith("M") or period == "M13":  # M13 is the annual average
+            continue
+        try:
+            points[(int(row["year"]), int(period[1:]))] = float(row["value"])
+        except (KeyError, TypeError, ValueError):
+            continue  # BLS prints "-" for months it never published (the 2025 lapse)
+    return points
+
+
+def _months_back(key: tuple[int, int], count: int) -> tuple[int, int]:
+    year, month = key
+    month -= count
+    while month <= 0:
+        month += 12
+        year -= 1
+    return year, month
+
+
+def _annualized(points: dict, latest: tuple[int, int], back: int, per_year: float) -> float | None:
+    """Percent change over `back` months, raised to `per_year` to annualize."""
+    start = points.get(_months_back(latest, back))
+    end = points.get(latest)
+    if not start or not end or start <= 0:
+        return None
+    return ((end / start) ** per_year - 1.0) * 100.0
+
+
+def fetch_inflation(timeout: float = INFLATION_TIMEOUT) -> dict | None:
+    """Pull CPI-U from BLS. Returns None on any failure - the caller keeps its cache."""
+    this_year = datetime.now().year
+    body = json.dumps({
+        "seriesid": [CPI_HEADLINE, CPI_CORE, CPI_HEADLINE_SA, CPI_CORE_SA],
+        "startyear": str(this_year - 2),
+        "endyear": str(this_year),
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        BLS_API_URL, data=body, headers={"Content-Type": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("status") != "REQUEST_SUCCEEDED":
+        return None
+
+    series = payload.get("Results", {}).get("series", [])
+    points = {s.get("seriesID"): _cpi_points(s) for s in series if isinstance(s, dict)}
+    headline = points.get(CPI_HEADLINE) or {}
+    if not headline:
+        return None
+
+    latest = max(headline)
+    headline_yoy = _annualized(headline, latest, 12, 1.0)
+    if headline_yoy is None:
+        return None
+
+    core = points.get(CPI_CORE) or {}
+    head_sa = points.get(CPI_HEADLINE_SA) or {}
+    core_sa = points.get(CPI_CORE_SA) or {}
+    sa_latest = max(head_sa) if head_sa else None
+    core_sa_latest = max(core_sa) if core_sa else None
+
+    return {
+        "headline": headline_yoy,
+        "core": _annualized(core, max(core), 12, 1.0) if core else None,
+        "headline_3mo": _annualized(head_sa, sa_latest, 3, 4.0) if sa_latest else None,
+        "headline_6mo": _annualized(head_sa, sa_latest, 6, 2.0) if sa_latest else None,
+        "as_of": f"{MONTH_ABBR[latest[1] - 1]} {latest[0]}",
+        "live": True,
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def inflation_verdict(snapshots: list[dict], cpi: float) -> dict:
+    """Split active balance by whether its rate outruns inflation."""
+    above = [s for s in snapshots if s["rate"] > cpi]
+    below = [s for s in snapshots if s["rate"] <= cpi]
+    total = sum(s["total"] for s in snapshots)
+    above_total = sum(s["total"] for s in above)
+    return {
+        "above": above_total,
+        "below": total - above_total,
+        "above_count": len(above),
+        "below_count": len(below),
+        "fraction": (above_total / total) if total > 0 else 0.0,
+        "real_blended": blended_rate(snapshots) - cpi,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
 
@@ -403,6 +575,7 @@ def blank_data() -> dict:
         "monthly_minimum": 0.0,
         "monthly_target": 0.0,
         "default_payment": 375.0,
+        "inflation": {},
     }
 
 
@@ -476,6 +649,8 @@ def load_data() -> dict:
             data[key] = max(0.0, float(raw.get(key, fallback) or 0.0))
         except (TypeError, ValueError):
             data[key] = fallback
+    cached = raw.get("inflation")
+    data["inflation"] = cached if isinstance(cached, dict) else {}
     return data
 
 
@@ -553,6 +728,14 @@ class StudentLoanMotivatorApp:
         self._pay_signature: tuple | None = None
         self._trophy_signature: tuple | None = None
 
+        # Bundled numbers first so the card renders instantly; the cached ones
+        # win if they exist, and a live fetch overwrites both a moment later.
+        self._inflation_pending: dict | None = None
+        self.inflation = dict(FALLBACK_INFLATION)
+        cached = self.data.get("inflation") or {}
+        if cached.get("headline") is not None:
+            self.inflation.update(cached)
+
         root.title("Student Loan Motivator")
         root.configure(bg=THEME_BG)
         # A hard-coded size larger than the screen gets clamped by the window
@@ -570,6 +753,44 @@ class StudentLoanMotivatorApp:
 
         self.build_ui()
         self.tick()
+        self.refresh_inflation()
+
+    # -- inflation --------------------------------------------------------
+
+    def inflation_is_stale(self) -> bool:
+        stamp = str(self.inflation.get("fetched_at") or "")
+        if not stamp:
+            return True
+        try:
+            age = datetime.now() - parse_dt_str(stamp)
+        except (ValueError, TypeError):
+            return True
+        return age.total_seconds() > INFLATION_MAX_AGE_HOURS * 3600
+
+    def refresh_inflation(self) -> None:
+        """Kick off a background CPI fetch. Never blocks the UI, never raises.
+
+        CPI prints once a month, so a stale cache costs nothing and the fetch is
+        skipped entirely most launches. BLS also rate-limits keyless callers.
+        """
+        if not self.inflation_is_stale():
+            return
+
+        def worker() -> None:
+            result = fetch_inflation()
+            if result:
+                # Drop it in a slot and let the tick pick it up. Tcl is not
+                # thread-safe and even root.after() from another thread raises
+                # "main thread is not in main loop" - no Tk call happens here.
+                self._inflation_pending = result
+
+        threading.Thread(target=worker, name="cpi-fetch", daemon=True).start()
+
+    def apply_inflation(self, figures: dict) -> None:
+        self.inflation = dict(FALLBACK_INFLATION)
+        self.inflation.update(figures)
+        self.data["inflation"] = dict(self.inflation)
+        self.persist()
 
     # -- persistence ------------------------------------------------------
 
@@ -592,16 +813,32 @@ class StudentLoanMotivatorApp:
 
     def card(self, parent: tk.Widget, title: str, row: int, col: int, **grid) -> tuple[tk.Frame, tk.Label]:
         outer = tk.Frame(parent, bg=THEME_BORDER, bd=0)
-        outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=4, **grid)
+        outer.grid(row=row, column=col, sticky="nsew", padx=5, pady=3, **grid)
         inner = tk.Frame(outer, bg=THEME_PANEL, bd=0)
         inner.pack(fill="both", expand=True, padx=1, pady=1)
         header = tk.Label(
             inner, text=title, font=FONT_CARD, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w"
         )
-        header.pack(fill="x", padx=12, pady=(8, 4))
+        header.pack(fill="x", padx=12, pady=(6, 3))
         body = tk.Frame(inner, bg=THEME_PANEL)
-        body.pack(fill="both", expand=True, padx=12, pady=(0, 9))
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 7))
         return body, header
+
+    def legend_row(self, parent: tk.Widget, row: int, color: str) -> dict:
+        """Dot + amount + explanation, one line, aligned across rows."""
+        holder = tk.Frame(parent, bg=THEME_PANEL)
+        holder.grid(row=row, column=0, columnspan=2, sticky="ew", pady=(2, 0))
+        holder.grid_columnconfigure(2, weight=1)
+
+        tk.Label(holder, text="●", font=FONT_SMALL, bg=THEME_PANEL, fg=color).grid(
+            row=0, column=0, padx=(0, 6)
+        )
+        amount = tk.Label(holder, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_TEXT,
+                          width=11, anchor="w")
+        amount.grid(row=0, column=1, sticky="w")
+        note = tk.Label(holder, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w")
+        note.grid(row=0, column=2, sticky="w")
+        return {"amount": amount, "note": note}
 
     def scrollable(self, parent: tk.Widget) -> tk.Frame:
         """A vertically scrolling region that only shows its bar when needed."""
@@ -654,7 +891,6 @@ class StudentLoanMotivatorApp:
         return btn
 
     def build_ui(self) -> None:
-        self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
 
         # ---- header ----
@@ -704,19 +940,43 @@ class StudentLoanMotivatorApp:
             widget.bind("<Button-1>", self.open_target_modal)
 
         self.payoff_bar = Bar(hero_body, height=10)
-        self.payoff_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(9, 0))
+        self.payoff_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.payoff_label = tk.Label(
             hero_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w"
         )
-        self.payoff_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.payoff_label.grid(row=2, column=0, sticky="w", pady=(3, 0))
 
-        # ---- middle row: race + bleeding ----
-        middle = tk.Frame(self.root, bg=THEME_BG)
-        middle.grid(row=2, column=0, sticky="ew", padx=4)
-        middle.grid_columnconfigure(0, weight=3)
-        middle.grid_columnconfigure(1, weight=2)
+        # The cheap tier isn't worth attacking; this is the part that is.
+        self.above_floor_label = tk.Label(
+            hero_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_WARN, anchor="e"
+        )
+        self.above_floor_label.grid(row=2, column=1, sticky="e", pady=(3, 0))
 
-        race_body, self.race_header = self.card(middle, "THE RACE", 0, 0)
+        # ---- body: two columns ----
+        #
+        # Everything used to stack in full-width bands, which meant Kill Order -
+        # the panel you actually work in - was last in line for leftover height
+        # and got squeezed to a couple of visible rows. Splitting the body lets
+        # the short reference cards stack down the right while Kill Order takes
+        # every pixel the left column has left.
+        body = tk.Frame(self.root, bg=THEME_BG)
+        body.grid(row=2, column=0, sticky="nsew", padx=4)
+        self.root.grid_rowconfigure(2, weight=1)
+        body.grid_columnconfigure(0, weight=3)
+        body.grid_columnconfigure(1, weight=2)
+        body.grid_rowconfigure(0, weight=1)
+
+        left_col = tk.Frame(body, bg=THEME_BG)
+        left_col.grid(row=0, column=0, sticky="nsew")
+        left_col.grid_columnconfigure(0, weight=1)
+        left_col.grid_rowconfigure(1, weight=1)
+
+        right_col = tk.Frame(body, bg=THEME_BG)
+        right_col.grid(row=0, column=1, sticky="nsew")
+        right_col.grid_columnconfigure(0, weight=1)
+        right_col.grid_rowconfigure(2, weight=1)
+
+        race_body, self.race_header = self.card(left_col, "THE RACE", 0, 0)
         race_body.grid_columnconfigure(1, weight=1)
 
         tk.Label(race_body, text="Interest", font=FONT_LABEL, bg=THEME_PANEL, fg=THEME_DANGER, width=9, anchor="w").grid(row=0, column=0, sticky="w")
@@ -731,21 +991,56 @@ class StudentLoanMotivatorApp:
         self.race_paid_value = tk.Label(race_body, text="$0.00", font=FONT_VALUE_M, bg=THEME_PANEL, fg=THEME_GOOD, width=11, anchor="e")
         self.race_paid_value.grid(row=1, column=2, sticky="e", pady=(5, 0))
 
+        # The old BLEEDING card showed the same month-interest number as the
+        # Interest bar right here, so it was two cards saying one thing. Its
+        # burn rates live on as a footnote under the bars instead.
+        self.race_burn = tk.Label(race_body, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_DIM, anchor="w")
+        self.race_burn.grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         self.race_verdict = tk.Label(race_body, text="", font=FONT_CARD, bg=THEME_PANEL, fg=THEME_TEXT, anchor="w")
-        self.race_verdict.grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self.race_verdict.grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
         self.race_detail = tk.Label(race_body, text="", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w", justify="left")
-        self.race_detail.grid(row=3, column=0, columnspan=3, sticky="w")
+        self.race_detail.grid(row=4, column=0, columnspan=3, sticky="w")
 
-        bleed_body, _ = self.card(middle, "BLEEDING", 0, 1)
-        self.bleed_value = tk.Label(bleed_body, text="$0.00", font=FONT_VALUE_L, bg=THEME_PANEL, fg=THEME_DANGER, anchor="w")
-        self.bleed_value.pack(anchor="w")
-        tk.Label(bleed_body, text="interest accrued this month", font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_DIM, anchor="w").pack(anchor="w")
-        self.bleed_rates = tk.Label(bleed_body, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_MUTED, anchor="w", justify="left")
-        self.bleed_rates.pack(anchor="w", pady=(6, 0))
+        # ---- inflation ----
+        # Hero number is the REAL rate, not CPI - that's the thing you can't
+        # read anywhere else. The CPI figures themselves are the supporting
+        # column on the right.
+        infl_body, self.infl_header = self.card(right_col, "vs INFLATION", 0, 0)
+        infl_body.grid_columnconfigure(0, weight=1)
+        infl_body.grid_columnconfigure(1, weight=0)
 
-        # ---- kill order ----
-        kill_body, self.kill_header = self.card(self.root, "KILL ORDER", 3, 0)
-        self.root.grid_rowconfigure(3, weight=1)
+        infl_left = tk.Frame(infl_body, bg=THEME_PANEL)
+        infl_left.grid(row=0, column=0, sticky="sw")
+        self.infl_real = tk.Label(
+            infl_left, text="--", font=FONT_VALUE_L, bg=THEME_PANEL, fg=THEME_DANGER, anchor="w",
+        )
+        self.infl_real.pack(anchor="w")
+        self.infl_real_caption = tk.Label(
+            infl_left, text="real rate after CPI", font=FONT_SMALL, bg=THEME_PANEL,
+            fg=THEME_DIM, anchor="w",
+        )
+        self.infl_real_caption.pack(anchor="w")
+
+        self.infl_figures = tk.Label(
+            infl_body, text="", font=FONT_MONO, bg=THEME_PANEL, fg=THEME_MUTED,
+            anchor="e", justify="left",
+        )
+        self.infl_figures.grid(row=0, column=1, sticky="e")
+
+        # One bar, two meanings: the red fill is balance priced above CPI, the
+        # green track behind it is the balance inflation is quietly eating.
+        self.infl_bar = Bar(infl_body, height=9, track=INFLATION_UNDER)
+        self.infl_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(9, 3))
+
+        # Legend under the bar. Colored dot, amount, then what it MEANS - the
+        # first cut said "above CPI / under it" and nobody could tell what was
+        # above what.
+        self.infl_above = self.legend_row(infl_body, 2, THEME_DANGER)
+        self.infl_below = self.legend_row(infl_body, 3, THEME_GOOD)
+
+        # ---- kill order: fills whatever the left column has left ----
+        kill_body, self.kill_header = self.card(left_col, "KILL ORDER", 1, 0)
         self.kill_container = self.scrollable(kill_body)
         self.kill_empty = tk.Label(
             self.kill_container,
@@ -756,13 +1051,8 @@ class StudentLoanMotivatorApp:
             anchor="w",
         )
 
-        # ---- bottom row: payments + trophies ----
-        bottom = tk.Frame(self.root, bg=THEME_BG)
-        bottom.grid(row=4, column=0, sticky="ew", padx=4, pady=(0, 8))
-        bottom.grid_columnconfigure(0, weight=3)
-        bottom.grid_columnconfigure(1, weight=2)
-
-        pay_body, self.pay_header = self.card(bottom, "PAYMENTS THIS MONTH", 0, 0)
+        # ---- payments + trophies stack down the right column ----
+        pay_body, self.pay_header = self.card(right_col, "PAYMENTS THIS MONTH", 1, 0)
         pay_body.grid_columnconfigure(0, weight=1)
         self.pay_container = tk.Frame(pay_body, bg=THEME_PANEL)
         self.pay_container.grid(row=0, column=0, sticky="nsew")
@@ -772,7 +1062,7 @@ class StudentLoanMotivatorApp:
             bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
         )
 
-        trophy_body, self.trophy_header = self.card(bottom, "ELIMINATED", 0, 1)
+        trophy_body, self.trophy_header = self.card(right_col, "ELIMINATED", 2, 0)
         trophy_body.grid_columnconfigure(0, weight=1)
         self.trophy_container = tk.Frame(trophy_body, bg=THEME_PANEL)
         self.trophy_container.grid(row=0, column=0, sticky="nsew")
@@ -786,7 +1076,7 @@ class StudentLoanMotivatorApp:
         self.status_label = tk.Label(
             self.root, text="", font=FONT_SMALL, bg=THEME_BG, fg=THEME_DIM, anchor="w"
         )
-        self.status_label.grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.status_label.grid(row=3, column=0, sticky="ew", padx=16, pady=(2, 7))
 
     def toggle_fullscreen(self, _event=None) -> None:
         self.root.attributes("-fullscreen", not bool(self.root.attributes("-fullscreen")))
@@ -1436,6 +1726,21 @@ class StudentLoanMotivatorApp:
             self.payoff_bar.set(0.0, THEME_PANEL_ALT)
             self.payoff_label.configure(text="Add original loan amounts to track lifetime progress.")
 
+        split = above_floor_split(snapshots)
+        if split["count"] and split["above"] > 0:
+            self.above_floor_label.configure(
+                text=f"Above {split['floor']:.2f}%:  {money(split['above'])}"
+                     f"  -  {split['fraction'] * 100:.1f}% of the balance"
+                     f"  ({split['count']} loan{'s' if split['count'] != 1 else ''})",
+                fg=THEME_WARN,
+            )
+        elif snapshots:
+            self.above_floor_label.configure(
+                text=f"Everything left is at {split['floor']:.2f}% - the cheap tier", fg=THEME_GOOD
+            )
+        else:
+            self.above_floor_label.configure(text="")
+
         pace, pace_source = self.planned_monthly()
         free_date, months = freedom_date(total_owed, blended_rate(snapshots), pace, today)
         if total_owed <= 0 and self.data["loans"]:
@@ -1471,8 +1776,8 @@ class StudentLoanMotivatorApp:
         elif month_paid <= 0:
             self.race_verdict.configure(text="NOT IN THE FIGHT YET", fg=THEME_DIM)
             self.race_detail.configure(
-                text=f"Break-even for {today.strftime('%B')} is {money(break_even)} - that's the rent\n"
-                     f"just to stand still. Everything past it shrinks the debt."
+                text=f"{money(break_even)} is the rent to stand still this month. "
+                     f"Everything past it shrinks the debt."
             )
         elif month_paid >= break_even:
             ahead = month_paid - break_even
@@ -1490,12 +1795,13 @@ class StudentLoanMotivatorApp:
                      f"{'s' if days_left != 1 else ''} left to catch up."
             )
 
-        # -- bleeding --
-        self.bleed_value.configure(text=money(month_interest))
-        self.bleed_rates.configure(
-            text=f"{money(total_daily)}/day   {money(total_daily / 24.0)}/hr\n"
-                 f"{money(total_daily * days_in_month(today))} full month"
+        self.race_burn.configure(
+            text=f"burning {money(total_daily)}/day  -  {money(total_daily / 24.0)}/hr"
+                 f"  -  {money(break_even)} for the full month"
         )
+
+        # -- inflation --
+        self.render_inflation(snapshots)
 
         # -- kill order --
         self.render_kill_order(ordered, accent)
@@ -1521,6 +1827,61 @@ class StudentLoanMotivatorApp:
     # Rebuilding these rows on every tick made the panel strobe once a second
     # and left it blank for part of each frame. Build only when the underlying
     # set actually changes; otherwise just retext what moved.
+
+    def render_inflation(self, snapshots: list[dict]) -> None:
+        figures = self.inflation
+        cpi = figures.get("headline")
+
+        # Two by two, padded to fixed widths so the mono columns line up on the
+        # decimal point. Four figures in two lines instead of four - vertical
+        # space in this window belongs to Kill Order.
+        def cell(label: str, value: float | None, width: int) -> str:
+            return f"{label:<{width}}" + (f"{value:5.2f}%" if value is not None else "   --")
+
+        pairs = (
+            (("headline 12-mo", figures.get("headline")), ("3-mo ann.", figures.get("headline_3mo"))),
+            (("core 12-mo", figures.get("core")), ("6-mo ann.", figures.get("headline_6mo"))),
+        )
+        self.infl_figures.configure(text="\n".join(
+            f"{cell(*left, 15)}   {cell(*right, 11)}" for left, right in pairs
+        ))
+
+        stamp = f"CPI-U  {figures.get('as_of', '--')}"
+        if not figures.get("live"):
+            stamp += "  (offline)"
+        self.infl_header.configure(text=f"vs INFLATION  -  {stamp}")
+
+        if cpi is None or not snapshots:
+            self.infl_real.configure(text="--", fg=THEME_DIM)
+            self.infl_real_caption.configure(text="add loans to compare")
+            self.infl_bar.set(0.0, THEME_PANEL_ALT)
+            for legend in (self.infl_above, self.infl_below):
+                legend["amount"].configure(text="")
+                legend["note"].configure(text="")
+            return
+
+        split = inflation_verdict(snapshots, cpi)
+        real = split["real_blended"]
+        blended = blended_rate(snapshots)
+        self.infl_real.configure(
+            text=f"{real:+.2f}%", fg=THEME_DANGER if real > 0 else THEME_GOOD
+        )
+        # Spell out the arithmetic - a bare "+0.37%" doesn't say where it came from.
+        self.infl_real_caption.configure(text=f"{blended:.2f}% blended - {cpi:.2f}% CPI")
+
+        self.infl_bar.set(split["fraction"], THEME_DANGER)
+
+        above_n, below_n = split["above_count"], split["below_count"]
+        self.infl_above["amount"].configure(text=money(split["above"]) if above_n else "")
+        self.infl_above["note"].configure(
+            text=f"on {above_n} loan{'s' if above_n != 1 else ''} priced over {cpi:.2f}% - really costing you"
+            if above_n else ""
+        )
+        self.infl_below["amount"].configure(text=money(split["below"]) if below_n else "")
+        self.infl_below["note"].configure(
+            text=f"on {below_n} loan{'s' if below_n != 1 else ''} under {cpi:.2f}% - inflation eats these"
+            if below_n else ""
+        )
 
     def render_kill_order(self, ordered: list[dict], accent: str) -> None:
         signature = tuple(s["id"] for s in ordered)
@@ -1562,13 +1923,15 @@ class StudentLoanMotivatorApp:
                 frame, text="TARGET" if is_target else f"#{i + 1}", font=FONT_LABEL,
                 bg=THEME_WARN if is_target else bg,
                 fg=ENTRY_FG if is_target else THEME_DIM, width=7,
-            ).grid(row=0, column=0, padx=(8, 11), pady=5)
+            ).grid(row=0, column=0, padx=(8, 11), pady=2)
 
             name = tk.Label(frame, text="", font=FONT_CARD, bg=bg, fg=THEME_TEXT,
-                            anchor="w", width=17)
+                            anchor="w", width=16)
             name.grid(row=0, column=1, sticky="w")
 
-            detail = tk.Label(frame, text="", font=FONT_MONO, bg=bg, fg=THEME_MUTED, anchor="w")
+            # Fixed width, or a narrow window trims the "/day" off the end.
+            detail = tk.Label(frame, text="", font=FONT_MONO, bg=bg, fg=THEME_MUTED,
+                              anchor="w", width=17)
             detail.grid(row=0, column=2, sticky="w")
 
             total = tk.Label(frame, text="", font=FONT_VALUE_M, bg=bg, fg=THEME_TEXT,
@@ -1592,7 +1955,7 @@ class StudentLoanMotivatorApp:
             )
 
     def render_payments(self, month_payments: list[dict], now: datetime) -> None:
-        shown = sorted(month_payments, key=lambda p: p["date"], reverse=True)[:8]
+        shown = sorted(month_payments, key=lambda p: p["date"], reverse=True)[:5]
         signature = tuple(p["id"] for p in shown) + (len(month_payments),)
         if signature != self._pay_signature:
             self.build_payment_rows(shown, len(month_payments))
@@ -1690,16 +2053,19 @@ class StudentLoanMotivatorApp:
                  + (f", {money(killed)} borrowed" if killed > 0 else "")
         )
 
-        for i, loan in enumerate(dead):
+        # Newest kills first, capped - the count and total are in the header,
+        # and this card must not outgrow the panel you actually work in.
+        shown = sorted(dead, key=lambda l: str(l.get("eliminated_on") or ""), reverse=True)[:3]
+        for i, loan in enumerate(shown):
             frame = tk.Frame(self.trophy_container, bg=THEME_PANEL)
             frame.grid(row=i, column=0, sticky="ew", pady=2)
             frame.grid_columnconfigure(1, weight=1)
 
             tk.Label(
-                frame, text="KILLED", font=FONT_LABEL, bg="#166534", fg=THEME_TEXT, width=7, pady=2,
+                frame, text="KILLED", font=FONT_SMALL, bg="#166534", fg=THEME_TEXT, width=8, pady=1,
             ).grid(row=0, column=0, padx=(0, 11))
             tk.Label(
-                frame, text=loan["name"], font=(FONT_BODY[0], FONT_BODY[1], "overstrike"),
+                frame, text=loan["name"], font=(FONT_SMALL[0], FONT_SMALL[1], "overstrike"),
                 bg=THEME_PANEL, fg=THEME_MUTED, anchor="w",
             ).grid(row=0, column=1, sticky="w")
             tk.Label(
@@ -1708,10 +2074,23 @@ class StudentLoanMotivatorApp:
             ).grid(row=0, column=2, sticky="e")
             self.trophy_rows.append(frame)
 
+        if len(dead) > len(shown):
+            more = tk.Label(
+                self.trophy_container, text=f"+ {len(dead) - len(shown)} earlier",
+                font=FONT_SMALL, bg=THEME_PANEL, fg=THEME_DIM, anchor="w",
+            )
+            more.grid(row=len(shown), column=0, sticky="w", pady=(3, 0))
+            self.trophy_rows.append(more)
+
     # -- loop -------------------------------------------------------------
 
     def tick(self) -> None:
         now = datetime.now()
+
+        pending, self._inflation_pending = self._inflation_pending, None
+        if pending:
+            self.apply_inflation(pending)
+
         slot = int(now.timestamp()) // QUOTE_ROTATION_SECONDS
         if slot != self._quote_slot:
             self._quote_slot = slot

@@ -143,6 +143,14 @@ Worth promoting these into a real `tests/` dir if the math grows.
 
 ## Log
 
+**2026-08-05** — Added an "above the floor" readout to the hero card, opposite
+the lifetime-progress line: total balance on every loan priced above the cheapest
+rate tier, plus that slice as a percentage of the whole balance. The floor is
+derived as the minimum active rate (with a 0.005-point tolerance so a matching
+sub/unsub pair reads as one tier) rather than hard-coded, so it rises on its own
+as tiers get killed. When only the floor tier remains, the line flips to a green
+"everything left is cheap" note.
+
 **2026-07-29** — Layout pass. The Race now measures interest from the 1st of the
 month rather than from the snapshot instant: exact when the snapshot predates the
 1st, estimated at the snapshot's daily rate (with intra-month payments added back

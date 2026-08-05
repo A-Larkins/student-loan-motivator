@@ -112,7 +112,10 @@ FONT_VALUE_S = ("Menlo", 11, "bold")
 FONT_MONO = ("Menlo", 9)
 FONT_MONO_S = ("Menlo", 8)
 
-PANEL_PAD = 14  # inset from a panel's edge to its content
+PANEL_PAD = 14   # inset from a panel's edge to its content
+PANEL_HEAD = 34  # title row height inside a panel
+LOAN_ROW_H = 27
+LOAN_FOOTER_H = 26
 
 WIN_WIDTH = 1240
 WIN_HEIGHT = 1020
@@ -1702,16 +1705,20 @@ class StudentLoanMotivatorApp:
         right_w = width - pad - right_x
         bottom = height - pad - status_h
 
+        # Kill Order takes exactly the height its rows need - it's a short list,
+        # and a panel padded out with empty space reads as unfinished. Payments
+        # takes the slack underneath instead.
         race_h = 122
+        loans_h = min(self.loans_height(m), bottom - y - race_h - 2 * gut - 90)
         self.paint_race(m, pad, y, left_w, race_h)
-        self.paint_loans(m, pad, y + race_h + gut, left_w, bottom - y - race_h - gut)
+        self.paint_loans(m, pad, y + race_h + gut, left_w, loans_h)
+        month_y = y + race_h + loans_h + 2 * gut
+        self.paint_month(m, pad, month_y, left_w, bottom - month_y)
 
         infl_h = 196
         self.paint_inflation(m, right_x, y, right_w, infl_h)
-        month_h = 104
-        self.paint_month(m, right_x, y + infl_h + gut, right_w, month_h)
-        self.paint_trophies(m, right_x, y + infl_h + month_h + 2 * gut, right_w,
-                            bottom - y - infl_h - month_h - 2 * gut)
+        self.paint_trophies(m, right_x, y + infl_h + gut, right_w,
+                            bottom - y - infl_h - gut)
 
         self.paint_status(m, pad, height - pad - status_h + 4, width - 2 * pad)
 
@@ -1897,6 +1904,15 @@ class StudentLoanMotivatorApp:
             ("Days left", str(days_left), THEME_TEXT),
         ])
 
+    def loans_height(self, m: dict) -> float:
+        """Exactly the height the loan list needs, footer included.
+
+        Must stay the inverse of the `available` arithmetic in paint_loans, or
+        the panel sizes itself for every loan and then reports one as hidden.
+        """
+        rows = max(1, len(m["ordered"]))
+        return PANEL_HEAD + rows * LOAN_ROW_H + LOAN_FOOTER_H + PANEL_PAD
+
     def paint_loans(self, m: dict, x: float, y: float, w: float, h: float) -> None:
         c = self.deck
         cx, cy, cw = self.panel(x, y, w, h, "KILL ORDER",
@@ -1906,14 +1922,10 @@ class StudentLoanMotivatorApp:
                           font=FONT_BODY, fill=THEME_DIM, anchor="w")
             return
 
-        # Rows breathe into the space the panel has rather than clumping at the
-        # top of an empty box, but never so far apart that the list stops
-        # reading as one thing.
-        footer_h = 24
-        available = y + h - PANEL_PAD - footer_h - cy
-        row_h = max(30, min(40, available / max(1, len(m["ordered"]))))
-        fits = max(1, int(available // row_h))
+        available = y + h - PANEL_PAD - LOAN_FOOTER_H - cy
+        fits = max(1, int(available // LOAN_ROW_H))
         shown = m["ordered"][:fits]
+        row_h = LOAN_ROW_H
         cpi = m["cpi"]
 
         for i, snap in enumerate(shown):

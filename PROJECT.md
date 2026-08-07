@@ -60,13 +60,32 @@ Autopay hits the *account*, not a loan — the servicer decides the split, and t
 transaction history doesn't say which loan got what. So a payment may carry an
 empty `loan_id`, meaning "whole account."
 
-Those get expanded into synthetic per-loan payments split proportionally to
-snapshot principal, tagged with `parent_id` so the UI regroups them into the one
-payment that was actually made. It's an approximation, and deliberately so: the
-next snapshot overwrites it with ground truth, so the error can't compound.
+Those get expanded into synthetic per-loan payments tagged with `parent_id` so
+the UI regroups them into the one payment that was actually made.
+
+**The split is a cascade, not a proportion.** The original guess was that the
+servicer spreads a payment across every active loan in proportion to principal.
+Reading the actual transaction history says otherwise: the entire payment lands
+on *one* loan, and the next loan starts receiving money only once that one is
+paid off. The signature is unmistakable — derive daily accrual from each
+payment's interest portion and it walks smoothly down for months, then jumps
+back up the moment a loan is paid off and the payments roll onto the next one.
+The first payment after a rollover is nearly all interest, because the loan it
+landed on has been accruing untouched the whole time.
+
+So `expand_payments` walks payments in date order against a running per-loan
+balance seeded from each snapshot, and allocates down the kill order: interest
+then principal, remainder rolling to the next loan. Targeted payments draw down
+the same running balance, so killing a loan by hand correctly redirects later
+account payments onto the next target.
+
+Proportional splitting was wrong in both directions — it understated progress on
+the loan actually being attacked and invented progress on loans that never got a
+cent. Still an approximation of the servicer's exact ordering, and still
+self-healing: the next snapshot overwrites it with ground truth.
 
 Payments targeted at a specific loan (the normal case when working the kill
-order) bypass all of this and apply directly.
+order) still apply directly to that loan.
 
 ### Principal and accrued interest are separate fields
 A servicer's "Current Balance" is principal **plus** unpaid interest. Loading the
@@ -128,6 +147,14 @@ Worth promoting these into a real `tests/` dir if the math grows.
 - **Scheduled-payoff comparison.** Servicers publish an estimated payment
   schedule and final payoff date. Contrasting that against the current pace is a
   strong motivator and is currently computed by hand, not in the app.
+- **Accrued interest on loans you aren't attacking is invisible in the
+  transaction history.** The history only shows interest on loans that *received*
+  a payment, so the untouched ones look inert while they quietly stack unpaid
+  interest — and it ambushes the first payment that rolls onto them. The
+  projection models this correctly, but only if `snapshot_accrued` is entered per
+  loan. Leaving it at zero on the loans not being paid is the single largest
+  source of drift in the app, and the one number the history will never show you.
+  Pull per-loan accrued from the servicer at snapshot time, not just principal.
 
 ### Open questions
 - Should an eliminated loan's original amount still count toward the lifetime
@@ -142,6 +169,27 @@ Worth promoting these into a real `tests/` dir if the math grows.
 ---
 
 ## Log
+
+**2026-08-07 (payment allocation)** — Re-read the servicer transaction history
+and found the account-payment split was modelled wrong. Dividing each payment's
+interest portion by days since the previous payment gives daily accrual, and
+that series does two things the proportional model can't explain: it implies a
+single consistent rate across a dozen independent readings, and it walks down
+smoothly for months before jumping back up on a payoff. Payments land on one
+loan at a time and roll to the next only when the current one dies.
+
+`expand_payments` now cascades down the kill order against a running per-loan
+balance instead of splitting proportionally, with targeted payments drawing down
+the same state so a hand-made kill redirects later account payments. The payment
+autopsy names the loan the money actually hit — and both loans, "A then B", when
+a payment straddled a payoff.
+
+Verified with a 10-case suite (scratchpad): single-target landing, cascade on
+payoff, the rollover-is-all-interest signature, targeted-kill redirection,
+snapshot-date eligibility, overpayment reconciliation, eliminated-loan exclusion,
+no dollars evaporating between allocation and `project_loan`, and undated-row
+passthrough. Plus a render/autopsy smoke test. The rollover case reproduces the
+real one closely.
 
 **2026-08-05 (UI rebuild)** — The dashboard is now a single canvas instead of a
 tree of frames and labels. Aqua overrides half of what you ask a native widget

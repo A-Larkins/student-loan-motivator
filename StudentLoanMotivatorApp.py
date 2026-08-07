@@ -301,39 +301,121 @@ def project_loan(loan: dict, payments: list[dict], until: datetime) -> dict:
 ACCOUNT = ""  # loan_id of a payment made to the account as a whole
 
 
+def _accrue_to(entry: dict, when: datetime) -> None:
+    """Roll one running loan entry forward to `when`, same rule as project_loan."""
+    if when > entry["cursor"]:
+        elapsed = (when - entry["cursor"]).total_seconds() / SECONDS_PER_DAY
+        entry["accrued"] += daily_interest(entry["principal"], entry["rate"]) * elapsed
+        entry["cursor"] = when
+
+
+def _draw_down(entry: dict, amount: float) -> None:
+    """Interest first, then principal - the federal allocation order."""
+    to_interest = min(amount, entry["accrued"])
+    entry["accrued"] -= to_interest
+    entry["principal"] = max(0.0, entry["principal"] - (amount - to_interest))
+
+
 def expand_payments(payments: list[dict], loans: list[dict]) -> list[dict]:
     """Turn account-level payments into per-loan synthetic payments.
 
-    Autopay usually hits the account, not a loan, and the servicer spreads it
-    however it likes. We approximate that split proportionally to each active
-    loan's snapshot principal. It's an approximation on purpose - the next
-    monthly snapshot overwrites it with ground truth, so error can't compound.
+    Autopay hits the account, not a loan. The old guess here was that the
+    servicer spreads it proportionally across every active loan. The real
+    transaction history says otherwise: the whole payment lands on *one* loan,
+    and only when that loan is dead does the next one start receiving anything.
+    The tell is a payment right after a payoff that is nearly all interest -
+    the loan it just rolled onto has been accruing untouched the whole time,
+    and its unpaid interest gets eaten first.
+
+    So allocate the way the servicer actually does: cascade down the kill order,
+    interest then principal, remainder rolling to the next loan. Proportional
+    splitting understated the target's progress and invented progress on loans
+    that never got a cent.
+
+    Payments are walked in date order against a running per-loan balance, so a
+    targeted payment that kills a loan correctly pushes later account payments
+    onto the next target. Balances are seeded from each loan's snapshot and
+    accrued forward exactly as `project_loan` does, so every dollar allocated
+    here is a dollar that actually lands there.
 
     Synthetic rows carry `parent_id` so the UI can re-group them back into the
     single payment the user actually made.
     """
-    active = [l for l in loans if l.get("status") == "active"]
-    total = sum(max(0.0, float(l.get("snapshot_principal", 0.0))) for l in active)
+    state: dict[str, dict] = {}
+    for loan in loans:
+        if loan.get("status") != "active":
+            continue
+        snapshot_at = parse_dt_str(loan.get("snapshot_at") or datetime.now().isoformat())
+        state[loan["id"]] = {
+            "id": loan["id"],
+            "rate": float(loan.get("rate", 0.0)),
+            "principal": max(0.0, float(loan.get("snapshot_principal", 0.0))),
+            "accrued": max(0.0, float(loan.get("snapshot_accrued", 0.0))),
+            "cursor": snapshot_at,
+            "start": snapshot_at.date(),
+        }
 
-    expanded: list[dict] = []
+    dated: list[tuple[date, dict]] = []
+    passthrough: list[dict] = []
     for payment in payments:
-        if payment.get("loan_id"):
+        try:
+            dated.append((parse_date_str(payment.get("date")), payment))
+        except (ValueError, TypeError):
+            # Undated rows can't be sequenced; hand them back untouched rather
+            # than dropping them, and let project_loan skip them as it already does.
+            passthrough.append(payment)
+    dated.sort(key=lambda item: item[0])
+
+    expanded: list[dict] = list(passthrough)
+    for pay_day, payment in dated:
+        when = datetime.combine(pay_day, time.min)
+        for entry in state.values():
+            _accrue_to(entry, when)
+
+        amount = max(0.0, float(payment.get("amount", 0.0)))
+        target = payment.get("loan_id")
+        if target:
             expanded.append(payment)
+            entry = state.get(target)
+            if entry is not None and pay_day >= entry["start"]:
+                _draw_down(entry, amount)
             continue
-        if total <= 0:
-            continue
-        for loan in active:
-            share = max(0.0, float(loan.get("snapshot_principal", 0.0))) / total
-            if share <= 0:
+
+        # Account-level. project_loan ignores anything older than a loan's own
+        # snapshot, so a loan snapshotted after this date can't be a target -
+        # money sent there would silently evaporate.
+        eligible = [
+            e for e in state.values()
+            if pay_day >= e["start"] and e["principal"] + e["accrued"] > 0.005
+        ]
+        eligible.sort(key=lambda e: (-e["rate"], e["principal"] + e["accrued"]))
+
+        remaining = amount
+        last: dict | None = None
+        for entry in eligible:
+            if remaining <= 0.005:
+                break
+            take = min(remaining, entry["principal"] + entry["accrued"])
+            if take <= 0:
                 continue
+            _draw_down(entry, take)
+            remaining -= take
+            last = entry
             expanded.append(
                 {
                     **payment,
-                    "loan_id": loan["id"],
-                    "amount": float(payment.get("amount", 0.0)) * share,
+                    "loan_id": entry["id"],
+                    "amount": take,
                     "parent_id": payment["id"],
                 }
             )
+
+        # Paid more than the whole account owed. Park the excess on the last
+        # loan touched so the regrouped payment still sums to what was paid;
+        # project_loan floors it at zero from there.
+        if remaining > 0.005 and last is not None:
+            expanded[-1]["amount"] += remaining
+
     return expanded
 
 
@@ -1373,12 +1455,17 @@ class StudentLoanMotivatorApp:
 
         to_interest = 0.0
         to_principal = 0.0
+        landed: list[str] = []
         for snap in afters:
+            hit = False
             for applied in snap["payments_applied"]:
                 origin = applied["payment"].get("parent_id") or applied["payment"]["id"]
                 if origin == payment["id"]:
                     to_interest += applied["to_interest"]
                     to_principal += applied["to_principal"]
+                    hit = True
+            if hit:
+                landed.append(snap["name"])
 
         # Lifetime interest saved: killing principal stops it charging rent for
         # the remaining life of the loan. Approximated against the loan's own
@@ -1396,7 +1483,14 @@ class StudentLoanMotivatorApp:
         win, frame = self.modal("Payment Logged", 460, 330)
         tk.Label(frame, text="PAYMENT AUTOPSY", font=FONT_CARD, bg=THEME_BG, fg=THEME_MUTED).pack(anchor="w")
         tk.Label(frame, text=money(payment["amount"]), font=FONT_HERO, bg=THEME_BG, fg=THEME_GOOD).pack(anchor="w")
-        target = loan["name"] if loan else f"across {len(touched)} loans"
+        # An account payment no longer smears across every loan - it lands on the
+        # kill-order target, and names two loans only when it rolled over a payoff.
+        if loan:
+            target = loan["name"]
+        elif landed:
+            target = " then ".join(landed)
+        else:
+            target = "the account"
         tk.Label(frame, text=f"to {target}", font=FONT_BODY, bg=THEME_BG, fg=THEME_MUTED).pack(anchor="w")
 
         breakdown = tk.Frame(frame, bg=THEME_BG)
